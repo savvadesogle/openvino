@@ -567,6 +567,10 @@ ov::Any Plugin::get_property(const std::string& name, const ov::AnyMap& options)
         // Report is model-scoped: a plugin-level query always has an empty tensor-parallel seam set.
         return decltype(ov::intel_gpu::tp_seams)::value_type {};
     }
+    if (name == ov::intel_gpu::tp_output_seams) {
+        // Report is model-scoped: a plugin-level query always has an empty tensor-parallel output set.
+        return decltype(ov::intel_gpu::tp_output_seams)::value_type {};
+    }
     if (name == ov::internal::caching_properties) {
         return decltype(ov::internal::caching_properties)::value_type(get_caching_properties());
     }
@@ -849,6 +853,7 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
         ov::PropertyName{ov::compatibility_check.name(), PropertyMutability::RO},
         ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO},
         ov::PropertyName{ov::intel_gpu::tp_seams.name(), PropertyMutability::RO},
+        ov::PropertyName{ov::intel_gpu::tp_output_seams.name(), PropertyMutability::RO},
 
         // Configs
         ov::PropertyName{ov::enable_profiling.name(), PropertyMutability::RW},

@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -12,7 +12,10 @@
 // S07: N-split - TPShardTransform slices the constant weights along the output-channel axis
 //      so each rank uploads only its slice; rank 0 assembles the full output (all-gather
 //      equivalent, host-side concatenation). Non-divisible N falls back to REPLICA.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5 (S04, S05, S06, S07).
+// S08: K-split - TPShardTransform slices the constant weights AND the activation along the
+//      contraction axis; each rank computes a partial GEMM sum; rank 0 all-reduces (fp32 sum)
+//      and adds the replicated bias/residual terms exactly once.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04, S05, S06, S07, S08).
 
 #include <algorithm>
 #include <cmath>
@@ -106,6 +109,48 @@ std::shared_ptr<ov::Model> make_indivisible_projection_model() {
     auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
     auto result = std::make_shared<ov::op::v0::Result>(matmul);
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_indivisible");
+}
+
+// [S08] Residual projection: Parameter(x) -> MatMul(W) -> Add(residual) -> Add(bias) -> Result.
+// The MatMul output feeds an Add, so it is classified K_SPLIT. With tensor parallelism each
+// rank computes a partial GEMM over its slice of the contraction axis; the replicated residual
+// (a model input) and bias (a constant) must be added exactly once by the reducer.
+std::shared_ptr<ov::Model> make_ksplit_residual_model() {
+    auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8});
+    auto residual = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 16});
+    std::vector<float> weights_data(8 * 16);
+    for (size_t i = 0; i < weights_data.size(); ++i) {
+        const float mag = 0.04f * static_cast<float>((i % 6) + 1);
+        weights_data[i] = (i % 3 == 0) ? mag : -mag;
+    }
+    std::vector<float> bias_data(16);
+    for (size_t i = 0; i < bias_data.size(); ++i) {
+        bias_data[i] = 0.05f * static_cast<float>((i % 4) + 1) - 0.1f;
+    }
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8, 16}, weights_data);
+    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{16}, bias_data);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(x, weights, false, false);
+    auto add_residual = std::make_shared<ov::op::v1::Add>(matmul, residual);
+    auto add_bias = std::make_shared<ov::op::v1::Add>(add_residual, bias);
+    auto result = std::make_shared<ov::op::v0::Result>(add_bias);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{x, residual}, "tp_ksplit_residual");
+}
+
+// [S08] Same residual topology but with a contraction dimension (7) not divisible by the number
+// of ranks: the pass must NOT slice (no all-reduce) and the replicated full computation must
+// still match single-GPU inference.
+std::shared_ptr<ov::Model> make_ksplit_indivisible_model() {
+    auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 7});
+    auto residual = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 16});
+    std::vector<float> weights_data(7 * 16);
+    for (size_t i = 0; i < weights_data.size(); ++i) {
+        weights_data[i] = 0.03f * static_cast<float>((i % 5) + 1);
+    }
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{7, 16}, weights_data);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(x, weights, false, false);
+    auto add_residual = std::make_shared<ov::op::v1::Add>(matmul, residual);
+    auto result = std::make_shared<ov::op::v0::Result>(add_residual);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{x, residual}, "tp_ksplit_indivisible");
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -422,6 +467,121 @@ TEST_F(TensorParallelCompileGPU, NsplitNotDivisibleFallsBackToReplica) {
 
     auto tp_request = tp_compiled.create_infer_request();
     tp_request.set_input_tensor(input);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999);
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S08] GATE: K-split + all-reduce(sum). The residual projection is classified K_SPLIT; each
+// rank computes a partial GEMM on its contraction-axis slice and rank 0 exposes the full
+// result after summing the partials in fp32 and adding the replicated residual/bias once.
+TEST_F(TensorParallelCompileGPU, KsplitResidualParityMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_ksplit_residual_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) * 0.5f - 2.0f;
+        }
+    }
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, 16});
+    {
+        auto* data = residual.data<float>();
+        for (size_t i = 0; i < 16; ++i) {
+            data[i] = 0.25f * static_cast<float>((i % 5) + 1) - 0.6f;
+        }
+    }
+
+    // Reference: plain single-GPU inference.
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, input);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    // The projection must be classified K_SPLIT and set up as an all-reduce(sum) output.
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(output_seams.size(), 1u) << "Expected exactly one all-reduce output seam";
+    EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(0, input);
+    tp_request.set_input_tensor(1, residual);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    ASSERT_EQ(tp_output.get_shape(), (ov::Shape{1, 16}));
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999)
+        << "K-split all-reduce output diverged from the single-GPU reference";
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S08] Negative: a contraction dimension not divisible by the number of ranks must not be
+// sliced. The seam stays K_SPLIT (stable classification) but no all-reduce output is set up and
+// the replicated full computation still matches single-GPU inference.
+TEST_F(TensorParallelCompileGPU, KsplitNotDivisibleFallsBackToReplica) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_ksplit_indivisible_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 7});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 7; ++i) {
+            data[i] = static_cast<float>(i) - 3.0f;
+        }
+    }
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, 16});
+    {
+        auto* data = residual.data<float>();
+        for (size_t i = 0; i < 16; ++i) {
+            data[i] = 0.1f * static_cast<float>(i + 1);
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, input);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    // Classification is stable (no hard failure) ...
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+    // ... but nothing was sliced, so there is no assembly output (rank 0 computes the full result).
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    EXPECT_TRUE(output_seams.empty());
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(0, input);
+    tp_request.set_input_tensor(1, residual);
     tp_request.infer();
     const ov::Tensor tp_output = tp_request.get_output_tensor();
 

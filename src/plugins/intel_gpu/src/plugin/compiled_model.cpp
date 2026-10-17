@@ -369,6 +369,7 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
             ov::PropertyName{ov::runtime_requirements.name(), PropertyMutability::RO},
             ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO},
             ov::PropertyName{ov::intel_gpu::tp_seams.name(), PropertyMutability::RO},
+            ov::PropertyName{ov::intel_gpu::tp_output_seams.name(), PropertyMutability::RO},
         };
     }
     if (name == ov::model_name) {
@@ -397,6 +398,10 @@ ov::Any CompiledModel::get_property(const std::string& name) const {
     if (name == ov::intel_gpu::tp_seams) {
         // A plain (single-device) compiled model has no tensor-parallel seams.
         return decltype(ov::intel_gpu::tp_seams)::value_type{};
+    }
+    if (name == ov::intel_gpu::tp_output_seams) {
+        // A plain (single-device) compiled model has no tensor-parallel assembly outputs.
+        return decltype(ov::intel_gpu::tp_output_seams)::value_type{};
     }
 
     return m_config.get_property(name, OptionVisibility::RELEASE);

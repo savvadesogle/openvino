@@ -39,6 +39,18 @@ static constexpr Property<std::vector<int32_t>, PropertyMutability::RO> tp_ranks
 static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_seams{"TP_SEAMS"};
 
 /**
+ * @brief Read-only property reporting the model outputs that require a collective to be
+ * assembled on rank 0. Each entry is encoded as
+ * "<collective>:<producer>:<split_axis>:<shard_dim_size>:<replicated_adds>" (see
+ * ov::intel_gpu::tp_output_seam_to_string): ALL_GATHER entries are N-split outputs assembled
+ * by concatenation, ALL_REDUCE_SUM entries are K-split outputs summed with fp32 accumulation.
+ * Empty for non-TP compilation and for models without sharded outputs.
+ *
+ * [TP-GPU, S07/S08] Experimental GPU tensor-parallel support. See PLAN.md §4.3, §7.4.
+ */
+static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_output_seams{"TP_OUTPUT_SEAMS"};
+
+/**
  * @brief Internal/test flag that enables tensor-parallel compilation of a model.
  * Equivalent to requesting ov::hint::model_distribution_policy{TENSOR_PARALLEL}. It is mainly
  * intended for functional tests (mirrors ov::intel_cpu::enable_tensor_parallel).

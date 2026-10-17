@@ -1,12 +1,13 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S06] Experimental GPU tensor-parallel support.
+// [TP-GPU, S04/S06/S07/S08] Experimental GPU tensor-parallel support.
 // Minimal tensor-parallel plan produced at compile time by the TPCoordinator.
-// S06 adds seam detection: TPShardTransform (identity/analysis pass) classifies
-// MatMul/FullyConnected nodes and the coordinator collects them into TPPlan.seams.
-// Seams are metadata only at this stage - NO weight slicing and NO collectives are
-// performed yet (S07/S08). See PLAN.md §4.2, §4.3, §4.4.
+// S06 adds seam detection: TPShardTransform classifies MatMul/FullyConnected nodes and the
+// coordinator collects them into TPPlan.seams. S07 adds N-split weight slicing + all-gather
+// output seams. S08 adds K-split weight/activation slicing + all-reduce(sum) output seams
+// (fp32 accumulation; replicated bias/residual terms are added once by the reducer).
+// See PLAN.md §4.2, §4.3, §4.4, §7.4.
 
 #pragma once
 
@@ -15,6 +16,9 @@
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "openvino/core/shape.hpp"
+#include "openvino/core/type/element_type.hpp"
 
 namespace ov {
 class Model;
@@ -49,8 +53,7 @@ enum class TPCollectiveKind : uint8_t {
  * @brief A single seam description.
  *
  * S06 populates node_name/node_type/kind/collective deterministically from the graph.
- * The remaining fields are placeholders reserved for S07/S08 (real slicing) and are NOT
- * consumed by any runtime behavior yet.
+ * S07/S08 additionally fill split_axis/shard_dim_size when the node is really sliced.
  */
 struct TPSeam {
     //! Friendly name of the detected node (stable for a given input model).
@@ -68,30 +71,65 @@ struct TPSeam {
 };
 
 /**
- * @brief Describes a model output that is produced (possibly through a chain of purely
- * element-wise operations) by an N-split GEMM and therefore must be assembled from the
- * per-rank slices on rank 0 - the all-gather equivalent (S07).
+ * @brief Kind of a replicated additive term that each rank adds to a K-split partial GEMM
+ * output (a bias / residual that must be counted exactly ONCE by the reducer, see PLAN §4.3).
+ */
+enum class TPReplicatedAddKind : uint8_t {
+    NONE = 0,    //!< no replicated additive term
+    CONSTANT,    //!< a constant already broadcast-expanded to the model output shape
+    INPUT,       //!< a model input tensor (e.g. a residual stream) replicated on every rank
+};
+
+/**
+ * @brief A replicated additive term of a K-split (all-reduce sum) output seam.
  *
- * With an equal split the rank-r slice spans [rank_r * (shard_dim_size / num_ranks),
- * (rank_r + 1) * (shard_dim_size / num_ranks)) along split_axis.
+ * Each rank computes `partial_r + term` and the reducer computes
+ * `full = sum_r partial_r + term` as `sum_r (partial_r + term) - (num_ranks - 1) * term`.
+ * Constants are pre-expanded to the (static) model output shape at compile time; inputs are
+ * broadcast from their runtime shape by aligning trailing dimensions (S08).
+ */
+struct TPReplicatedAdd {
+    TPReplicatedAddKind kind = TPReplicatedAddKind::NONE;
+    //! [CONSTANT] broadcast-expanded fp32 values, row-major, length == product(output shape).
+    std::vector<float> values;
+    //! [INPUT] index of the replicated model input (into ov::Model::inputs()/get_parameters()).
+    size_t input_index = 0;
+};
+
+/**
+ * @brief Describes a model output that is produced (possibly through a chain of purely
+ * element-wise operations) by a sharded GEMM and therefore must be assembled on rank 0.
+ *
+ *  - ALL_GATHER (N-split, S07): each rank holds a disjoint slice of the last axis; the full
+ *    tensor is assembled by concatenation. With an equal split the rank-r slice spans
+ *    [rank_r * (shard_dim_size / num_ranks), (rank_r + 1) * (shard_dim_size / num_ranks))
+ *    along split_axis.
+ *  - ALL_REDUCE_SUM (K-split, S08): each rank holds a partial GEMM sum of the full output
+ *    shape; the full tensor is the fp32 sum of the rank partials (with the replicated terms
+ *    subtracted once).
  */
 struct TPOutputSeam {
     //! Index of the model output (into ov::Model::outputs()).
     size_t output_index = 0;
+    //! Collective required to assemble this output (ALL_GATHER for N-split, ALL_REDUCE_SUM for K-split).
+    TPCollectiveKind collective = TPCollectiveKind::ALL_GATHER;
     //! Axis along which the full tensor is sharded (negative = counted from the end, -1 = last).
     int64_t split_axis = -1;
     //! Size of the sharded dimension in the FULL (unsharded) tensor.
     int64_t shard_dim_size = -1;
-    //! Friendly name of the N-split GEMM that produces this output (debug/introspection).
+    //! Friendly name of the sharded GEMM that produces this output (debug/introspection).
     std::string producer_node;
+    //! [S08, ALL_REDUCE_SUM] replicated additive terms added once by the reducer (bias/residual).
+    std::vector<TPReplicatedAdd> replicated_adds;
 };
 
 /**
  * @brief Compile-time tensor-parallel plan.
  *
- * Describes the participating ranks (and their device ids), the classified seams detected
- * by TPShardTransform and the model outputs that require an all-gather (S07). The structure
- * is deliberately minimal so that later stages can extend it without touching the public API.
+ * Describes the participating ranks (and their device ids), the classified seams detected by
+ * TPShardTransform and the model outputs that require a collective to be assembled on rank 0
+ * (all-gather for N-split, all-reduce sum for K-split, S07/S08). The structure is deliberately
+ * minimal so that later stages can extend it without touching the public API.
  */
 struct TPPlan {
     //! Rank indices, e.g. {0, 1} for a 2-GPU TP group.

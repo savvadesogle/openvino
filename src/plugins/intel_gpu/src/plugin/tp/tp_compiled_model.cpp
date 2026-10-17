@@ -47,8 +47,11 @@ void TPCompiledModel::build_output_ports() {
     for (size_t i = 0; i < rank0_outputs.size(); ++i) {
         const auto& port = rank0_outputs[i];
         const auto* seam = m_plan.find_output_seam(i);
-        if (seam == nullptr || seam->shard_dim_size <= 0 || seam->split_axis > -1) {
-            // Only last-axis N-split is supported at S07; otherwise expose the native port.
+        // Only ALL_GATHER (last-axis N-split) outputs need a synthetic full-shape port: their
+        // rank-0 native shape is the slice. ALL_REDUCE_SUM (K-split) outputs already have the
+        // full shape on every rank, so the native port is exposed as-is.
+        if (seam == nullptr || seam->collective != TPCollectiveKind::ALL_GATHER ||
+            seam->shard_dim_size <= 0 || seam->split_axis > -1) {
             m_outputs.push_back(port);
             continue;
         }
@@ -113,6 +116,7 @@ ov::Any TPCompiledModel::get_property(const std::string& name) const {
         auto props = m_ranks.front()->get_property(name).as<std::vector<ov::PropertyName>>();
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_seams.name(), PropertyMutability::RO});
+        props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_output_seams.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::hint::model_distribution_policy.name(), PropertyMutability::RO});
         return props;
     }
@@ -126,6 +130,14 @@ ov::Any TPCompiledModel::get_property(const std::string& name) const {
             seams.push_back(tp_seam_to_string(seam));
         }
         return decltype(ov::intel_gpu::tp_seams)::value_type{std::move(seams)};
+    }
+    if (name == ov::intel_gpu::tp_output_seams) {
+        std::vector<std::string> seams;
+        seams.reserve(m_plan.output_seams.size());
+        for (const auto& seam : m_plan.output_seams) {
+            seams.push_back(tp_output_seam_to_string(seam));
+        }
+        return decltype(ov::intel_gpu::tp_output_seams)::value_type{std::move(seams)};
     }
     if (name == ov::hint::model_distribution_policy) {
         return decltype(ov::hint::model_distribution_policy)::value_type{ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};

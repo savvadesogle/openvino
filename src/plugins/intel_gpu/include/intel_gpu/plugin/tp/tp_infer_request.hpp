@@ -1,11 +1,12 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05] Experimental GPU tensor-parallel support.
-// TPInferRequest drives k per-rank inference requests (one per device) for a replicated
-// graph: inputs are replicated to every rank, only rank-0 outputs are exposed.
-// At this stage ranks are identical (no sharding yet), so no collective transport is needed.
-// See PLAN.md §4.4, §5 (S05).
+// [TP-GPU, S05/S07/S08] Experimental GPU tensor-parallel support.
+// TPInferRequest drives k per-rank inference requests (one per device): inputs are replicated
+// to every rank, only rank-0 outputs are exposed. S07 assembles N-split outputs (all-gather
+// equivalent, concatenation); S08 sums K-split outputs (all-reduce sum) with fp32 accumulation
+// and adds replicated bias/residual terms exactly once.
+// See PLAN.md §4.3, §4.4, §7.4.
 
 #pragma once
 
@@ -56,10 +57,14 @@ private:
     // Ensures every rank sees the same input data as rank 0 before execution.
     void replicate_inputs();
 
-    // [S07] Assembles the full model outputs on rank 0 from the per-rank N-slices
-    // (all-gather equivalent: concatenation, no arithmetic). Replicated outputs are copied
-    // over from rank 0 verbatim.
+    // [S07/S08] Assembles the full model outputs on rank 0: N-split outputs are all-gathered
+    // (concatenation, no arithmetic), K-split outputs are all-reduced (fp32 sum) and replicated
+    // bias/residual terms are added once. Replicated outputs are copied over from rank 0 verbatim.
     void assemble_outputs();
+
+    // [S08] Sums the per-rank partial GEMM outputs in fp32 (all-reduce sum) and applies the
+    // output seam's replicated additive terms exactly once.
+    void assemble_reduce_sum(size_t output_index, const TPOutputSeam& seam);
 
     // Lazily allocates the host output tensor exposed for port @p index (full shape).
     ov::SoPtr<ov::ITensor>& output_tensor(size_t index) const;

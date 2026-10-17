@@ -61,7 +61,9 @@ std::string tp_seam_to_string(const TPSeam& seam) {
 }
 
 std::string tp_output_seam_to_string(const TPOutputSeam& seam) {
-    return seam.producer_node + ":" + std::to_string(seam.split_axis) + ":" + std::to_string(seam.shard_dim_size);
+    return std::string(to_string(seam.collective)) + ":" + seam.producer_node + ":" +
+           std::to_string(seam.split_axis) + ":" + std::to_string(seam.shard_dim_size) + ":" +
+           std::to_string(seam.replicated_adds.size());
 }
 
 const char* tp_seams_rt_info_key() {

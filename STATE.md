@@ -21,7 +21,7 @@
 - [x] S05 Stage1.2 TPInferRequest (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S06 Stage2.1 TPShardTransform-скелет (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S07 Stage2.2 N-split + all-gather (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S08 Stage2.3 K-split + allreduce
+- [x] S08 Stage2.3 K-split + allreduce (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S09 Stage2.4 int4_ASYM
 - [ ] S10 Stage3.1 per-rank KV
 - [ ] S11 Stage3.2 linear_attention
@@ -43,6 +43,8 @@
 
 | 2026-10-17 | S07 Stage2.2 N-split + all-gather | **частично** (код+тест готовы) | **Rank в пасс — Вариант A**: новые internal-опции `ov::intel_gpu::tp_rank`/`tp_num_ranks` (`TP_RANK`/`TP_NUM_RANKS`, `OV_CONFIG_RELEASE_INTERNAL_OPTION`, default -1/1) в `internal_properties.hpp`+`options.inl`; `TPCoordinator::compile_model_tensor_parallel` штампует их в per-rank `ExecutionConfig` через `set_property` (прямое значение переживает `clone()`+`finalize()` в `clone_and_transform_model`); `TransformationsPipeline::apply` строит `TPShardTransform(config.get_tp_rank(), config.get_tp_num_ranks())`. **Срез**: пасс теперь при `rank>=0 && num_ranks>1` для каждого `N_SPLIT`-узла с константными весами заменяет Constant на слайс по N-оси (для `MatMul` — по `transpose_b`; `[K,n_r]`/`[N,n_r]`), режет bias (операнд 2) тем же диапазоном, заполняет `TPSeam.split_axis=-1`/`shard_dim_size=N`, возвращает `true`. Слайс — на OV-уровне, до фьюжнов и до `propagate_constants` (upload), на устройство едет только `[K, N/ranks]`. Sub-byte (int4) явно отклоняется (`int4 = S09`). **Fallback**: `N % num_ranks != 0` ИЛИ потребитель слайса не element-wise/Result → узел понижается до `REPLICA` (полные веса) — корректность сохраняется, жёсткого throw нет (задокументировано). **All-gather-эквивалент (host-side)**: `TPShardTransform` дополнительно строит `std::vector<TPOutputSeam>` (rt_info `intel_gpu_tp_output_seams`) — индексы model-output, достижимые из срезанного узла только через element-wise (Add/Mul/Relu/Gelu/…); `TPPlan.output_seams` собирается на ранге-0. `TPCompiledModel::build_output_ports()` публикует для таких выходов СИНТЕТИЧЕСКИЙ порт полной формы `[.., N]` (Parameter+Result, хранятся в объекте) — контракт S05 «выходы только rank-0» сохранён. `TPInferRequest` теперь владеет выходными host-тензорами (`m_output_tensors`), после `infer()` собирает полный выход конкатенацией регионов `[r*N/k,(r+1)*N/k]` (`copy_last_axis_region`, без арифметики), реплики копирует с rank-0. Тесты S07: `NsplitMlpParityMatchesSingleGpu` (MatMul[8,16]→Relu→Result, TP2 vs 1-GPU, cos>0.999, full shape [1,16]), `NsplitNotDivisibleFallsBackToReplica` (N=15 → REPLICA, паритет). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. S04/«Блокеры») |
 
+| 2026-10-17 | S08 Stage2.3 K-split + allreduce | **частично** (код+тест готовы) | **K-split весов**: `TPShardTransform` для `K_SPLIT` с константными весами (2D) режет Constant по K-оси (`find_weight_k_axis`: `transpose_b=false`→axis 0 `[K,N]`, `true`→axis 1 `[N,K]`), `offset=rank*K/ranks`, `K % ranks == 0`, элемент ≥8 бит (int4 → S09). **K-срез активации**: A-операнд (input 0) режется по последней оси через `ov::op::v8::Slice` (start/stop/step/axis=-1) — каждый ранг считает истинную частичную GEMM-сумму `A_r @ W_r` (не «A_full @ W_r», который размерно некорректен). **Численный инвариант**: выбирается вариант (б) из промпта (срез и весов, и активации); K-границы кратны `group_size` при int4 (S09), на S08 `group_size=1`. **Replicated additive terms**: `scan_k_reduction` проходит по потребителям K-узла через elementwise и собирает `Add`-слагаемые, которые реплицированы на каждом ранге: Constant (bias) и/или прямой вход-`Parameter` (residual). Истинный residual, произведённый внутри графа (не Constant/не Parameter), или не-elementwise потребитель → узел НЕ режется (корректность требует device-side allreduce ДО Add — S09+); классификация (`seam.kind=K_SPLIT`) при этом сохраняется (стабильность `tp_seams`). **Allreduce(sum)**: `TPInferRequest::assemble_reduce_sum` суммирует per-rank выходы в fp32 (PLAN §7.4), затем вычитает `(num_ranks-1)*term` для каждого replicated-слагаемого (bias/residual добавляются ровно один раз), затем кастует к выходному типу. `TPOutputSeam.collective` + `replicated_adds`; новый RO-property `ov::intel_gpu::tp_output_seams`. `build_output_ports` решейпит только `ALL_GATHER`. Тесты: `KsplitResidualParityMatchesSingleGpu` (residual-Parameter + bias-Constant, TP2 vs 1-GPU cos>0.999, проверка `tp_output_seams==ALL_REDUCE_SUM`), `KsplitNotDivisibleFallsBackToReplica` (K=7, без среза, `tp_output_seams=={}`, паритет). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -52,7 +54,8 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
-  Актуально для S05 и S06: GATE подтверждён по коду/плану, прогон `tensor_parallel` тестов — вне сессии.
+  Актуально для S05, S06, S07 и S08: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
+  тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
   не изменяем. Формулировка «push» в старых записях/промптах считается снятой.
@@ -60,6 +63,49 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S08 done (частично, 2026-10-17)** — Stage 2.3 K-split + all-reduce(sum). Артефакты/решения:
+  - **Выбор по срезу активации — вариант (б)**: и веса, и активация режутся по K. Прямой вариант (а)
+    («A_full @ W[:,k_r]») размерно некорректен (несовпадение K), поэтому отвергнут. Веса — `slice_constant`
+    по K-оси; активация — `ov::op::v8::Slice` по последней оси (`axis=-1`, `start=offset`, `stop=offset+count`),
+    вставляется в граф (работает и для `Parameter`, и для промежуточных тензоров). x-срез не меняет контракт
+    входов (пользователь даёт полный тензор, режется в графе per-rank).
+  - **Геометрия K**: `find_weight_k_axis` (2D-веса обязательны) — `transpose_b=false` → ось 0 (`[K,N]`),
+    `transpose_b=true` → ось 1 (`[N,K]`); `K = weights.shape[k_axis]`; срез при `K % num_ranks == 0` и
+    `act_last_dim == K`; элемент ≥ 8 бит. `group_size` учитывается только в S09.
+  - **Механизм allreduce — host-side, subtractive** (S08-компромисс, device-side — S12): каждый ранг
+    считает `partial_r + term` (term = replicated bias/residual), reducer делает
+    `full = sum_r(partial_r + term) - (num_ranks-1)*term = sum_r partial_r + term`. Это даёт «term один раз»
+    без удаления Add/Constant из графа. fp32-аккумуляция обязательна (PLAN §7.4).
+  - **Replicated terms**: `scan_k_reduction` собирает из elementwise-цепочки после K-узла: `Add(K, Constant)`
+    → CONSTANT (broadcast-expanded к форме выхода на compile-time); `Add(K, Parameter)` → INPUT (индекс
+    параметра; broadcast по хвостовым осям в runtime). Формула `TPReplicatedAdd`. Любой другой Add-операнд
+    (истинный residual, `Add(mm,mm)`) или не-elementwise потребитель → узел НЕ режется (safe=false).
+  - **Стабильность `tp_seams`**: при отказе от среза `seam.kind`/`collective` СОХРАНЯЮТСЯ (не деградируют
+    в REPLICA) — иначе сломается S06-тест `ShardTransformClassifiesResidualProjectionAsKSplit`
+    (`Add(matmul,matmul)` → нережущийся K_SPLIT). Не-срезанный узел = реплика (rank0 считает полный GEMM),
+    `tp_output_seams` пуст → сборка «replicated copy» → корректно.
+  - **Новый property** `ov::intel_gpu::tp_output_seams` (RO, `vector<string>`, формат
+    `COLLECTIVE:producer:split_axis:shard_dim_size:repl_adds`); `TPCompiledModel`/обычный/плагин отдают
+    согласованно (пусто вне TP). `tp_seams` формат НЕ менялся.
+  - **Артефакты**: `tp_plan.{hpp,cpp}` (`TPReplicatedAdd`/`TPReplicatedAddKind`, `TPOutputSeam.collective`+
+    `replicated_adds`, encoder), `tp_shard_transform.cpp` (K-ветка + `find_weight_k_axis`/`slice_last_axis`/
+    `constant_to_floats`/`broadcast_expand`/`scan_k_reduction` + `is_sliceable_type` guard и на N-split),
+    `tp_compiled_model.cpp` (build_output_ports только ALL_GATHER + tp_output_seams), `tp_infer_request.{hpp,cpp}`
+    (`assemble_reduce_sum`, `tensor_to_floats`/`floats_to_tensor`/`accumulate_scaled_broadcast`),
+    `internal_properties.hpp`, `compiled_model.cpp`/`plugin.cpp` (property), тесты в `tensor_parallel.cpp`.
+  - **ОГРАНИЧЕНИЯ S08 (важно для S09+):**
+    1. Истинный residual (не Constant/Parameter, а результат внутри графа) НЕ поддержан → узел реплицируется.
+       Реальные трансформеры (`x = x + o_proj(attn)`) именно такие → на S08 их o_proj/down_proj не K-сплитятся,
+       пока device-side allreduce не будет вставлен ДО Add (S09+ или S12). GATE-модель использует residual-
+       `Parameter`/bias-`Constant` — это честно ограниченный, но корректный сценарий.
+    2. Срез активации по K конфликтует с N-split, если A — выход N-split узла (цепочка N→K). Комбинированный
+       сценарий не реализован (S08 не строит реальную all-gather между узлами) — задокументировано.
+    3. `slice_last_axis` требует, чтобы вход-активация имела статический ранг и статическую K-ось; иначе узел
+       реплицируется.
+  - **Заметка S08→S09 (int4_ASYM)**: K-границы должны быть кратны `group_size=128`; `slice_constant` сейчас
+    явно отклоняет sub-byte (`is_sliceable_type`), поэтому int4 K_SPLIT-узлы на S08 просто реплицируются
+    (не падают). S09: резать веса+scales+zp по group-границам, K кратно 128, N целыми oc-группами. GATE —
+    Qwen3.5-9B-int4 TP2 prefill паритет.
 - **S07 done (частично, 2026-10-17)** — Stage 2.2 N-split + all-gather-эквивалент. Артефакты/решения:
   - **Выбор механизма rank = Вариант A** (per-rank config): `ov::intel_gpu::tp_rank`/`tp_num_ranks`
     (RELEASE_INTERNAL) в `include/intel_gpu/runtime/internal_properties.hpp` + `options.inl`;
