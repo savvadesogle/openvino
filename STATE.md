@@ -4,7 +4,7 @@
 ## Управление
 | Поле | Значение |
 |---|---|
-| Ветка | master (S01 создаст feature/gpu-tensor-parallel) |
+| Ветка | feature/gpu-tensor-parallel (активна с S01, запушена в origin) |
 | Upstream tip базис | 85720fe2 (2026-10-17) |
 | ОС / железо | Windows primary; 2+ Intel Arc/BMG |
 | Тест-модель | models/Qwen3.5-9B-int4-ov (полная, кроме openvino_mtp_model.*) |
@@ -13,7 +13,7 @@
 ## Прогресс сессий
 - [x] Планирование (2026-10-17, PLAN.md готов)
 - [x] Базовая инициализация репо (2026-10-17): remotes origin/upstream, shallow-fetch tip 85720fe2, commit 6339e518 (PLAN/STATE/NEXT/.gitignore) запушен в origin master
-- [ ] S01 init (остаток: ветка feature/gpu-tensor-parallel, docs/notes/*, генерация NEXT.md для S02)
+- [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit "S01: project init notes + S02 prompt"
 - [ ] S02 L0-спайк A
 - [ ] S03 L0-спайк B (G0)
 - [ ] S04 Stage1.1 TPCoordinator
@@ -33,9 +33,27 @@
 ## Гейт-решения (журнал)
 | Дата | Гейт | Решение | Обоснование |
 |---|---|---|---|
+| 2026-10-17 | S01 init | done (GATE пройден) | ветка активна и запушена; 4 конспекта в docs/notes на уровне PLAN §3; STATE/NEXT обновлены (критерии PLAN §5 S01) |
 
 ## Блокеры / открытые вопросы
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
-- (генерируется в конце каждой сессии)
+- S02: следующий атом — L0-capability спайк; чеклист = docs/notes/l0-spike-plan.md §1;
+  результат писать в docs/notes/l0-spike.md. Нужна машина с 2+ Arc/BMG.
+- Находки S01 (не реализовывать до своих этапов; детали — в docs/notes/):
+  1. `tools/continuous_batching` в ЭТОМ репо отсутствует — GenAI CB живёт в
+     отдельном репо openvino.genai; в дереве openvino строка
+     MODEL_DISTRIBUTION_POLICY только в properties.hpp (+pybind). Учесть при S13.
+  2. `zeDeviceCanAccessPeer`/`zeDeviceGetP2PProperties`/`zeMemGetIpcHandle`/
+     `zeMemOpenIpcHandle` НЕ объявлены в дереве intel_gpu — S02 берёт системные
+     L0 headers/loader. `zexCounterBasedEventGetIpcHandle/OpenIpcHandle` есть
+     (zex_event.h:46-50, zex_common.h:167-204) и в плагине не используются.
+  3. CPU-механика TP делает только N-split FC, K-split/allreduce отсутствует —
+     allreduce(sum) для GPU проектируется с нуля (S08); CPU `split_parts` даёт
+     неравные хвосты (len%n) — для int4 K-границ НЕ годится (K кратно 128).
+  4. Counter-based events отключены на xe3/xe3p/unknown (ze_stream.cpp:246-250);
+     на BMG (Xe2) должны работать — S02 проверит фактически (capability-матрица).
+  5. Blob-cache GPU имеет compat-descriptor runtime requirements
+     (plugin/compiled_model.cpp:97-120) — per-rank кэш различать по (rank, device)
+     при S16.

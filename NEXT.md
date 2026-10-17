@@ -1,54 +1,59 @@
-# СЕССИЯ S01 — init репозитория (остаток) · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
+# СЕССИЯ S02 — L0-спайк A: capability-матрица (Windows, 2+ Arc/BMG) · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
 
 ## Как работать
 - Сначала полностью прочитай:
   1) C:\openvino-tp\PLAN.md — канон (НЕ редактировать в сессии)
   2) C:\openvino-tp\STATE.md — живое состояние
-- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S01 (таблица в PLAN.md §5).
+  3) C:\openvino-tp\docs\notes\l0-spike-plan.md — чеклист §1 (задача этой сессии)
+  4) при необходимости: C:\openvino-tp\docs\notes\gpu-plugin-arch.md §5
+     (что уже есть в дереве по L0/IPC) и cpu-tp-pattern.md (общий контекст TP)
+- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S02 (таблица в PLAN.md §5).
   Следующие этапы запрещены, даже если остаётся время/контекст. Остановка на GATE или
   блокере — нормальный результат; зафиксируй его в STATE.md.
 
 ## Контекст, который УЖЕ исполнен (не повторять)
-- Remotes настроены: origin = github.com/savvadesogle/openvino.git,
-  upstream = github.com/openvinotoolkit/openvino.git
-- master запушен: tip 85720fe2 (upstream) + 6339e518 (PLAN/STATE/NEXT) + 4c9b93c3 (STATE-аменд)
-- Worktree = shallow-fetch (depth=1) полного дерева OpenVINO + наши docs;
-  models/ в .gitignore
-- Тест-модель локально: C:\openvino-tp\models\Qwen3.5-9B-int4-ov
-  (полный снапшот; отсутствуют только openvino_mtp_model.{xml,bin} — не блокер)
+- S01 done: ветка feature/gpu-tensor-parallel создана от master (tip 24e336ca) и
+  запушена в origin; 4 конспекта в docs/notes/; commit "S01: project init notes + S02 prompt".
+- Тест-модель локально: C:\openvino-tp\models\Qwen3.5-9B-int4-ov (в этой сессии не нужна).
+- Железо: Windows-машина с 2+ discrete Intel GPU (Arc/Battlemage), PCIe.
 
-## Задача S01 (полный объём этой сессии)
-1. Ветка: создать feature/gpu-tensor-parallel от текущего master, переключиться на неё.
-2. docs/notes/ — четыре самодостаточных конспекта (точные пути:строки брать из
-   PLAN.md §3; будущие сессии НЕ должны пересобирать эти знания):
-   a) cpu-tp-pattern.md — механика TENSOR_PARALLEL в intel_cpu: стримы/ранги,
-      SubMemoryManager + allgather через spin-флаги, слайс FC по out-channels,
-      выводы для GPU-порта;
-   b) gpu-plugin-arch.md — компиляция и cldnn-граф, очереди/события/барьеры,
-      propagate_constants (upload констант), точка вставки TP-пассов,
-      ограничение «1 CompiledModel = 1 device»;
-   c) hetero-pp.md — как HETERO делает PIPELINE_PARALLEL и почему для TP
-      непригоден напрямую;
-   d) l0-spike-plan.md — чеклист S02 (zeInit/enum GPU, матрица
-      zeDeviceCanAccessPeer, IPC zeMemGetIpcHandle/OpenIpcHandle для памяти и
-      IPC event pool) и S03 (микробенч: peer-copy vs host-USM staging,
-      bw/latency).
-3. STATE.md — обновить: S01 = done + дата; блокеры не трогать (они актуальны).
-4. NEXT.md — перезаписать ПОЛНЫМ промптом сессии S02: цель (read-only спайк
-   L0 на Windows, 2+ Arc/BMG), шаги, ограничение «не мерить перф — это S03 /
-   не менять код OpenVINO», GATE «capability-матрица + IPC известны и записаны
-   в docs/notes/l0-spike.md», требование обновить STATE, сгенерировать NEXT
-   для S03 и запушить коммит.
-5. Commit: "S01: project init notes + S02 prompt" → push -u origin
-   feature/gpu-tensor-parallel.
+## Задача S02 (полный объём этой сессии)
+Read-only спайк Level Zero: зафиксировать capability-матрицу междевайсных путей
+(нужна как вход для дизайна коллективов TP). Никаких измерений производительности.
 
-## GATE S01 (критерии завершения)
-- Ветка активна и запушена; 4 конспекта в docs/notes/ на уровне PLAN §3.
-- STATE.md: S01 done. NEXT.md: готовый полный промпт S02.
-- Финальный ответ сессии: кратко — что сделано, что показал GATE,
-  и текст нового NEXT.md для пользователя.
+1. Инструмент: новый проект tools/l0_spike/ (только новые файлы ВНЕ src/**).
+   Вариант выбрать по факту: (a) standalone C++ (MSVC cl.exe, линковка ze_loader.lib,
+   системные Level Zero headers level_zero/ze_api.h); (b) Python ctypes по ze_loader.dll
+   (ноль сборки). Bundled zex-заголовки из src/plugins/intel_gpu/.../compute_runtime/*
+   можно использовать только как справку по zex counter-based events.
+2. Выполнить чеклист docs/notes/l0-spike-plan.md §1, шаги 1–6:
+   - zeInit(ZE_INIT_FLAG_GPU_ONLY), zeDriverGet, версии драйвера/loader'а;
+   - перечисление GPU (свойства: имя, тип, numSlices, память, numQueues);
+   - zeContextCreate на каждый device;
+   - zeDeviceCanAccessPeer — матрица N×N (все упорядоченные пары, вкл. i==j) +
+     zeDeviceGetP2PProperties (ACCESS/ATOMICS/ATOMICS_64BIT) для пар с доступом;
+   - IPC-память: zeMemAllocDevice → zeMemGetIpcHandle → zeMemOpenIpcHandle
+     (sanity на своём device, затем на каждом чужом) + zeMemCloseIpcHandle;
+   - IPC-events: zexCounterBasedEventCreate2 с ZEX_COUNTER_BASED_EVENT_FLAG_IPC →
+     zexCounterBasedEventGetIpcHandle → zexCounterBasedEventOpenIpcHandle +
+     минимальный smoke (wait на пире после signal), без таймингов.
+3. Результаты — в docs/notes/l0-spike.md: шапка (дата, Windows build, GPU/драйверы,
+   версии L0), таблицы из §1.7 плана, честная фиксация недоступного/непроверенного
+   (коды ze_result_t; если символ не экспортируется — так и написать).
+4. STATE.md: S02 = done + дата; заметки для S03 (в т.ч. сюрпризы и рабочая гипотеза
+   о дефолте коллективов, решение G0 — только в S03).
+5. NEXT.md — перезаписать ПОЛНЫМ промптом S03: микробенч peer-copy vs host-USM
+   staging (bw/latency) + решение G0; чеклист = l0-spike-plan.md §2.
+6. Commit (сообщение: "S02: L0 capability spike") → push origin feature/gpu-tensor-parallel.
+
+## GATE S02 (критерии завершения)
+- Capability-матрица + IPC-возможности (память и события) ИЗВЕСТНЫ и записаны
+  в docs/notes/l0-spike.md.
+- STATE.md: S02 done. NEXT.md: готовый полный промпт S03.
+- Финальный ответ сессии: кратко что сделано, что показал GATE, и текст нового NEXT.md.
 
 ## Жёсткие ограничения
+- НЕ МЕРИТЬ перф (тайминги/bandwidth) — это S03; S02 фиксирует только да/нет + коды.
 - НЕ изменять src/** и не запускать сборки/компиляции OpenVINO.
 - Не коммитить .bin/модельные файлы; секреты не писать в файлы/логи/историю.
 - Если push вернёт 403 — стоп: попроси пользователя выполнить gh auth login
