@@ -13,6 +13,8 @@
 
 namespace ov::intel_gpu {
 
+class TPCoordinator;
+
 class Plugin : public ov::IPlugin {
 private:
     std::string m_default_device_id = "0";
@@ -39,6 +41,15 @@ private:
     std::string get_device_id_from_config(const ov::AnyMap& config) const;
     std::string get_device_id(const ov::AnyMap& config) const;
     std::shared_ptr<RemoteContextImpl> get_default_context(const std::string& device_id, bool initialize = true) const;
+
+    // [TP-GPU, S04] Tensor-parallel compile path: returns true when the config asks for TP
+    // (either via ov::hint::model_distribution_policy{TENSOR_PARALLEL} or the internal
+    // ov::intel_gpu::enable_tensor_parallel flag).
+    bool is_tensor_parallel_requested(const ExecutionConfig& config) const;
+    // Builds a tensor-parallel group over all enumerated GPUs: k per-rank contexts/configs,
+    // one (currently unsharded) compiled graph per rank, wrapped in a TPCompiledModel.
+    std::shared_ptr<ov::ICompiledModel> compile_model_tensor_parallel(const std::shared_ptr<const ov::Model>& model,
+                                                                      const ov::AnyMap& orig_config) const;
 
     std::vector<ov::PropertyName> get_caching_properties() const;
     std::vector<ov::PropertyName> get_supported_properties() const;

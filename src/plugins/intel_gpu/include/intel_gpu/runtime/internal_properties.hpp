@@ -19,6 +19,25 @@ namespace ov::intel_gpu {
 static constexpr Property<std::string, PropertyMutability::RO> driver_version{"GPU_DRIVER_VERSION"};
 
 /**
+ * @brief Read-only property reporting the tensor-parallel ranks of a compiled model.
+ * The value is the list of rank indices (one per participating device) when the model was
+ * compiled with tensor parallelism; it is empty otherwise. Rank i is materialized on device
+ * with id = tp_rank_devices()[i].
+ *
+ * [TP-GPU, S04] Part of the experimental GPU tensor-parallel support. See PLAN.md §4.1.
+ */
+static constexpr Property<std::vector<int32_t>, PropertyMutability::RO> tp_ranks{"TP_RANKS"};
+
+/**
+ * @brief Internal/test flag that enables tensor-parallel compilation of a model.
+ * Equivalent to requesting ov::hint::model_distribution_policy{TENSOR_PARALLEL}. It is mainly
+ * intended for functional tests (mirrors ov::intel_cpu::enable_tensor_parallel).
+ *
+ * [TP-GPU, S04] Experimental GPU tensor-parallel support. See PLAN.md §4.1.
+ */
+static constexpr Property<bool, PropertyMutability::RW> enable_tensor_parallel{"ENABLE_TENSOR_PARALLEL"};
+
+/**
  * @brief Read-only property to get GPU device_id
  */
 static constexpr Property<std::string, PropertyMutability::RO> device_id{"GPU_DEVICE_ID"};

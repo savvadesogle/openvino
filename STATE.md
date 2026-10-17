@@ -17,7 +17,7 @@
 - [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit 7bd6c6d4 (локально)
 - [x] S02 L0-спайк A (2026-10-17): tools/l0_spike/{l0_capability.py,README.md,l0_capability_output.txt}; результаты — docs/notes/l0-spike.md; capability-матрица зафиксирована (GATE пройден)
 - [x] S03 L0-спайк B (G0) (2026-10-17): tools/l0_spike/l0_bench.py (+ output); bw/latency-таблицы — docs/notes/l0-spike.md §8; **G0 = host-USM staging** (журнал гейтов)
-- [ ] S04 Stage1.1 TPCoordinator
+- [x] S04 Stage1.1 TPCoordinator (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S05 Stage1.2 TPInferRequest
 - [ ] S06 Stage2.1 TPShardTransform-скелет
 - [ ] S07 Stage2.2 N-split + all-gather
@@ -37,8 +37,17 @@
 | 2026-10-17 | S01 init | done (локально) | артефакты GATE готовы: ветка активна, 4 конспекта в docs/notes, STATE/NEXT обновлены; commit 7bd6c6d4 локально |
 | 2026-10-17 | S02 L0-спайк A | done | capability-матрица известна и записана в docs/notes/l0-spike.md: 2×A770; canAccessPeer кросс = false; P2P кросс = 0x0; IPC-память UNSUPPORTED_FEATURE (core и ZEX_mem_ipc_handles); counter-based IPC event GetIpcHandle = OUT_OF_DEVICE_MEMORY. Решение G0 — в S03 (перф не мерялась) |
 | 2026-10-17 | **S03 L0-спайк B → G0** | **G0 = host-USM staging** | Микробенч (docs/notes/l0-spike.md §8): единственный рабочий междевайсный путь — dev_i→pinned host→dev_j; ~7–10 GB/s/плечо, ~4–5 GB/s end-to-end (16–128 MB); локальная same-device полоса 145–192 GB/s; кросс-shared USM = OUT_OF_DEVICE_MEMORY; peer/IPC NA (S02). Дефолт коллективов TP — host-USM staging; peer — runtime fast-path по `zeDeviceCanAccessPeer` |
+| 2026-10-17 | S04 Stage1.1 TPCoordinator | **частично** (код+тест готовы) | TP-ветка `compile_model`, `TPCoordinator`, `TPCompiledModel`, свойства (`model_distribution_policy`/`enable_tensor_parallel`/`tp_ranks`), GATE-тест `tensor_parallel.cpp` написаны. **GATE по сборке не подтверждён**: тулчейн (cl 14.44/cmake/ninja) есть, но ВСЕ сабмодули пусты (`git submodule status` → все с `-`; напр. `thirdparty/ittapi/ittapi`, `gtest`, `json/nlohmann_json`, `ocl/*`, `intel_gpu/thirdparty/onednn_gpu` = 0 файлов) → cmake configure падает (`ittapi::ittnotify does not represent a cmake target`). Инициализация сабмодулей = сетевой fetch → запрещён политикой. См. «Блокеры» |
 
 ## Блокеры / открытые вопросы
+- **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
+  MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
+  не инициализированы (пустые каталоги). `cmake -G Ninja -S . -B build_tp ...` падает на
+  `thirdparty/ittapi` (`ittapi::ittnotify does not represent a cmake target`), а также
+  отсутствуют `gtest`, `json/nlohmann_json`, `ocl/{cl_headers,clhpp_headers,icd_loader}`,
+  `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
+  = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
+  подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
   не изменяем. Формулировка «push» в старых записях/промптах считается снятой.
@@ -46,10 +55,35 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
-- S04 (следующий атом): Stage 1.1 `TPCoordinator` — k engines, TP-ветка
-  `Plugin::compile_model`, properties (`ov::hint::model_distribution_policy`,
-  `ov::intel_gpu::enable_tensor_parallel`, `tp_ranks`). GATE: TP-компиляция
-  2-GPU мини-сети с FC. Чеклист — PLAN §4.1–4.2, строка S04 таблицы §5.
+- **S04 done (частично, 2026-10-17)** — Stage 1.1 TPCoordinator. Артефакты:
+  - Свойства: `ov::intel_gpu::tp_ranks` (RO, `std::vector<int32_t>`) и
+    `ov::intel_gpu::enable_tensor_parallel` (RW, bool) —
+    `include/intel_gpu/runtime/internal_properties.hpp`; опции
+    `ov::hint::model_distribution_policy` (default пустой set) и
+    `ov::intel_gpu::enable_tensor_parallel` (default false) — `runtime/options.inl`.
+  - Новые файлы `include/intel_gpu/plugin/tp/{tp_plan,tp_coordinator,tp_compiled_model}.hpp`
+    и `src/plugin/tp/{tp_coordinator,tp_compiled_model}.cpp` (каркас; шардинг/коллективы НЕ
+    реализованы — S06+/S08+; ГЛАВНОЕ для S05: `TPCompiledModel::create_infer_request`
+    сейчас делегирует в rank-0 — заглушка).
+  - `plugin.cpp`: PP-проверка (`PIPELINE_PARALLEL`→throw), TP-ветка в `compile_model`,
+    TP-отказ при explicit remote context, `tp_ranks` в `get_property` и supported props;
+    `model_distribution_policy`/`enable_tensor_parallel` в supported props (RW).
+  - `compiled_model.cpp`: `tp_ranks` (+ RO `model_distribution_policy`/`enable_tensor_parallel`)
+    в supported props; `get_property(tp_ranks)` → `{}` для не-TP.
+  - GATE-тест: `tests/functional/behavior/tensor_parallel.cpp` (позитив 2-GPU + internal flag
+    + default + негативы: explicit `"GPU.0"`, `PIPELINE_PARALLEL`).
+- **Решение S04**: TP-группа = все перечисленные GPU (`m_device_map`); каждый ранг получает
+  СВОЙ `RemoteContextImpl`+`ExecutionConfig` (`remote_context.cpp:59` требует `devices.size()==1`),
+  модель клонируется per-rank через существующий `clone_and_transform_model`+`finalize`+
+  `CompiledModel` (шардинга нет → каждый ранг = полный граф). Обнаружение TP:
+  `Plugin::is_tensor_parallel_requested` (policy{TENSOR_PARALLEL} ИЛИ internal flag).
+  Explicit device id определяется по наличию `ov::device::id` в `orig_config` (Core кладёт
+  его только для явного `"GPU.0"`).
+- **ВАЖНО для S05** (Stage 1.2 TPInferRequest): `TPCompiledModel` уже создаёт k рангов и
+  держит `get_rank_models()`/`get_tp_plan()`. Нужно заменить делегирование в rank-0 на
+  реальный TPInferRequest: реплицировать входы на все ранги, инфер всех k графов, отдать
+  выходы rank-0; GATE — e2e паритет vs 1-GPU. Коллективы (all-gather/allreduce) ещё НЕ нужны
+  (шардирования нет → ранги идентичны). Среда сборки недоступна (см. «Блокеры»).
 - **Вход S04 из S03 (G0)**: дефолт коллективов = **host-USM staging**
   (`zeMemAllocHost` pinned + per-device command queue и `zeCommandListAppendMemoryCopy`,
   host-sync через `zeCommandQueueSynchronize`). Междевайсный путь на этой машине

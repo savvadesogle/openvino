@@ -275,6 +275,17 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
     ExecutionConfig config = m_configs_map.at(device_id);
     config.set_user_property(orig_config, OptionVisibility::RELEASE);
 
+    // [TP-GPU, S04] GPU supports tensor parallelism only; pipeline parallelism is rejected
+    // with a clear message instead of being silently ignored.
+    const auto& distribution_policy = config.get_model_distribution_policy();
+    OPENVINO_ASSERT(distribution_policy.count(ov::hint::ModelDistributionPolicy::PIPELINE_PARALLEL) == 0,
+                    "[GPU] PIPELINE_PARALLEL model distribution policy is not supported by the GPU plugin. ",
+                    "Use {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL} instead");
+
+    if (is_tensor_parallel_requested(config)) {
+        return compile_model_tensor_parallel(model, orig_config);
+    }
+
     auto transformed_model = clone_and_transform_model(model, config, context);
 
     config.finalize(context.get(), transformed_model.get());
@@ -297,6 +308,12 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model(const std::shared_ptr<
 
     ExecutionConfig config = m_configs_map.at(device_id);
     config.set_user_property(orig_config, OptionVisibility::RELEASE);
+
+    // [TP-GPU, S04] Tensor parallelism spans several devices, so it cannot be combined with a
+    // user-provided single-device remote context.
+    OPENVINO_ASSERT(!is_tensor_parallel_requested(config),
+                    "[GPU][TP] Tensor parallel cannot be requested together with an explicit remote context. ",
+                    "Compile with device name \"GPU\" and ov::hint::model_distribution_policy{TENSOR_PARALLEL}");
 
     auto transformed_model = clone_and_transform_model(model, config, context_impl);
 
@@ -541,6 +558,10 @@ ov::Any Plugin::get_property(const std::string& name, const ov::AnyMap& options)
             available_devices.push_back(dev.first);
         }
         return decltype(ov::available_devices)::value_type {available_devices};
+    }
+    if (name == ov::intel_gpu::tp_ranks) {
+        // Report is model-scoped: a plugin-level query always has an empty tensor-parallel rank set.
+        return decltype(ov::intel_gpu::tp_ranks)::value_type {};
     }
     if (name == ov::internal::caching_properties) {
         return decltype(ov::internal::caching_properties)::value_type(get_caching_properties());
@@ -822,6 +843,7 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
         ov::PropertyName{ov::intel_gpu::execution_units_count.name(), PropertyMutability::RO},
         ov::PropertyName{ov::intel_gpu::memory_statistics.name(), PropertyMutability::RO},
         ov::PropertyName{ov::compatibility_check.name(), PropertyMutability::RO},
+        ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO},
 
         // Configs
         ov::PropertyName{ov::enable_profiling.name(), PropertyMutability::RW},
@@ -853,6 +875,8 @@ std::vector<ov::PropertyName> Plugin::get_supported_properties() const {
         ov::PropertyName{ov::hint::model.name(), PropertyMutability::WO},
         ov::PropertyName{ov::intel_gpu::offload_ratio.name(), PropertyMutability::RW},
         ov::PropertyName{ov::intel_gpu::config_file.name(), PropertyMutability::RW},
+        ov::PropertyName{ov::hint::model_distribution_policy.name(), PropertyMutability::RW},
+        ov::PropertyName{ov::intel_gpu::enable_tensor_parallel.name(), PropertyMutability::RW},
     };
 
     return supported_properties;
