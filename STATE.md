@@ -37,11 +37,13 @@
 | 2026-10-17 | S02 L0-спайк A | done | capability-матрица известна и записана в docs/notes/l0-spike.md: 2×A770; canAccessPeer кросс = false; P2P кросс = 0x0; IPC-память UNSUPPORTED_FEATURE (core и ZEX_mem_ipc_handles); counter-based IPC event GetIpcHandle = OUT_OF_DEVICE_MEMORY. Решение G0 — в S03 (перф не мерялась) |
 
 ## Блокеры / открытые вопросы
-- S01 push: `git push -u origin feature/gpu-tensor-parallel` → **403** "Permission to
-  savvadesogle/openvino.git denied to savvadesogle". Нужно: пользователю выполнить
-  `gh auth login` с доступом на запись к origin (или обновить credentials/PAT с
-  правами contents:write; НЕ присылать токен текстом в чат). Локально закоммичено:
-  7bd6c6d4 (S01) + этот STATE-коммит; после авторизации — повторить push.
+- Push в origin: `git push -u origin feature/gpu-tensor-parallel` → **403** "Permission
+  to savvadesogle/openvino.git denied to savvadesogle" (повторно в S02). Нужно:
+  пользователю выполнить `gh auth login` с доступом на запись к origin (или обновить
+  credentials/PAT с правами contents:write; НЕ присылать токен текстом в чат).
+  Локально закоммичено и ждёт push: 7bd6c6d4 + d0d2a20c + b97946ad (S01/фиксы) и
+  e6cbc7d5 (S02); после авторизации — повторить `git push -u origin
+  feature/gpu-tensor-parallel`.
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
