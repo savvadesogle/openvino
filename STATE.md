@@ -4,7 +4,8 @@
 ## Управление
 | Поле | Значение |
 |---|---|
-| Ветка | feature/gpu-tensor-parallel (активна; S02 закоммичен локально; push в origin — см. Блокеры) |
+| Ветка | feature/gpu-tensor-parallel (активна, **только локально**) |
+| Remote-политика | **Работаем только локально, remote НЕ трогаем** (решение 2026-10-17): коммиты не пушим, origin/upstream не изменяем |
 | Upstream tip базис | 85720fe2 (2026-10-17) |
 | ОС / железо | Windows primary; 2+ Intel Arc/BMG |
 | Тест-модель | models/Qwen3.5-9B-int4-ov (полная, кроме openvino_mtp_model.*) |
@@ -12,8 +13,8 @@
 
 ## Прогресс сессий
 - [x] Планирование (2026-10-17, PLAN.md готов)
-- [x] Базовая инициализация репо (2026-10-17): remotes origin/upstream, shallow-fetch tip 85720fe2, commit 6339e518 (PLAN/STATE/NEXT/.gitignore) запушен в origin master
-- [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit 7bd6c6d4 (push 403 — ждёт авторизацию, см. Блокеры)
+- [x] Базовая инициализация репо (2026-10-17): remotes настроены (origin/upstream); shallow-fetch tip 85720fe2; commit 6339e518 (PLAN/STATE/NEXT/.gitignore). Далее — работа только локально.
+- [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit 7bd6c6d4 (локально)
 - [x] S02 L0-спайк A (2026-10-17): tools/l0_spike/{l0_capability.py,README.md,l0_capability_output.txt}; результаты — docs/notes/l0-spike.md; capability-матрица зафиксирована (GATE пройден)
 - [ ] S03 L0-спайк B (G0)
 - [ ] S04 Stage1.1 TPCoordinator
@@ -33,17 +34,14 @@
 ## Гейт-решения (журнал)
 | Дата | Гейт | Решение | Обоснование |
 |---|---|---|---|
-| 2026-10-17 | S01 init | done, кроме push (403) | артефакты GATE готовы: ветка активна, 4 конспекта в docs/notes, STATE/NEXT обновлены; критерий «запушена» отложен до `gh auth login` |
+| 2026-10-17 | S01 init | done (локально) | артефакты GATE готовы: ветка активна, 4 конспекта в docs/notes, STATE/NEXT обновлены; commit 7bd6c6d4 локально |
 | 2026-10-17 | S02 L0-спайк A | done | capability-матрица известна и записана в docs/notes/l0-spike.md: 2×A770; canAccessPeer кросс = false; P2P кросс = 0x0; IPC-память UNSUPPORTED_FEATURE (core и ZEX_mem_ipc_handles); counter-based IPC event GetIpcHandle = OUT_OF_DEVICE_MEMORY. Решение G0 — в S03 (перф не мерялась) |
 
 ## Блокеры / открытые вопросы
-- Push в origin: `git push -u origin feature/gpu-tensor-parallel` → **403** "Permission
-  to savvadesogle/openvino.git denied to savvadesogle" (повторно в S02). Нужно:
-  пользователю выполнить `gh auth login` с доступом на запись к origin (или обновить
-  credentials/PAT с правами contents:write; НЕ присылать токен текстом в чат).
-  Локально закоммичено и ждёт push: 7bd6c6d4 + d0d2a20c + b97946ad (S01/фиксы) и
-  e6cbc7d5 (S02); после авторизации — повторить `git push -u origin
-  feature/gpu-tensor-parallel`.
+- **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
+  локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
+  не изменяем. Формулировка «push» в старых записях/промптах считается снятой.
+  Локальные коммиты S01/S02: 7bd6c6d4, d0d2a20c, b97946ad, e6cbc7d5 (и далее).
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
