@@ -1,0 +1,77 @@
+﻿==============================================================================
+S02 L0 capability spike (read-only, no perf measurements)
+==============================================================================
+
+[0] Loader bind check
+    ze_loader.dll file version : 1.33.1.0
+    core symbols missing       : none
+
+[1] zeInit + drivers
+    zeInit(ZE_INIT_FLAG_GPU_ONLY) -> ZE_RESULT_SUCCESS
+    zeDriverGet(count) -> ZE_RESULT_SUCCESS count = 1
+    zeDriverGet(list)  -> ZE_RESULT_SUCCESS
+    driver[0] apiVersion -> ZE_RESULT_SUCCESS  (1.17)
+    driver[0] driverVersion=0x01039BD6  (ZE_RESULT_SUCCESS)
+    driver[0] ipcProperties flags=0x3 [MEMORY,EVENT_POOL]  (ZE_RESULT_SUCCESS)
+    driver[0] extensions: 64
+    driver[0] ipc/p2p/ext-of-interest: ['ZE_experimental_event_pool_counter_based', 'ZEX_counter_based_event', 'ZEX_mem_ipc_handles', 'ZE_intel_experimental_context_virtual_address_space_ipc_handle']
+    driver[0] zeDeviceGet count -> ZE_RESULT_SUCCESS, n=2
+      device[0.0] 'Intel(R) Arc(TM) A770 Graphics' type=1 vid=0x8086 did=0x56A0 numSlices=8 numSubslicesPerSlice=8 numEUsPerSubslice=8 coreClock=2400MHz
+      device[0.0] compute: maxGroup=1024 subGroups=[8, 16, 32]
+      device[0.0] mem: n=1 sizes=['15.56 GiB']
+      device[0.0] pci: 0000:05:00.0 gen-1 x-1 (0.0 GB/s)  (ZE_RESULT_SUCCESS)
+      device[0.1] 'Intel(R) Arc(TM) A770 Graphics' type=1 vid=0x8086 did=0x56A0 numSlices=8 numSubslicesPerSlice=8 numEUsPerSubslice=8 coreClock=2400MHz
+      device[0.1] compute: maxGroup=1024 subGroups=[8, 16, 32]
+      device[0.1] mem: n=1 sizes=['15.56 GiB']
+      device[0.1] pci: 0000:85:00.0 gen-1 x-1 (0.0 GB/s)  (ZE_RESULT_SUCCESS)
+
+    TOTAL GPU devices (ZE_DEVICE_TYPE_GPU in enumeration): 2
+
+[3] zeContextCreate (one per device, no flags)
+    ctx[0] 'Intel(R) Arc(TM) A770 Graphics' -> ZE_RESULT_SUCCESS
+    ctx[1] 'Intel(R) Arc(TM) A770 Graphics' -> ZE_RESULT_SUCCESS
+
+[4] zeDeviceCanAccessPeer matrix (rows = accessor i, cols = peer j)
+        j=0           j=1           
+    i=0  Y(SUCCESS)   n(SUCCESS)   
+    i=1  n(SUCCESS)   Y(SUCCESS)   
+
+[4b] zeDeviceGetP2PProperties for all ordered pairs
+    0->0 : flags=0x3 [ACCESS,ATOMICS]  rc=ZE_RESULT_SUCCESS
+    0->1 : flags=0x0 [-]  rc=ZE_RESULT_SUCCESS
+    1->0 : flags=0x0 [-]  rc=ZE_RESULT_SUCCESS
+    1->1 : flags=0x3 [ACCESS,ATOMICS]  rc=ZE_RESULT_SUCCESS
+
+[5] IPC device memory (1 MiB, align 64)
+    zexMemGetIpcHandles  resolved: yes
+    zexMemOpenIpcHandles resolved: yes
+    dev[0] zeMemAllocDevice -> ZE_RESULT_SUCCESS ptr=0xffffb80200180000
+    dev[0] zeMemGetIpcHandle (core) -> ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+    dev[0] zeMemAllocHost -> ZE_RESULT_SUCCESS ; zeMemGetIpcHandle(host) -> ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+    dev[0] zexMemGetIpcHandles: query=ZE_RESULT_ERROR_UNSUPPORTED_FEATURE n=0 get=ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+    dev[1] zeMemAllocDevice -> ZE_RESULT_SUCCESS ptr=0xffffd40100180000
+    dev[1] zeMemGetIpcHandle (core) -> ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+    dev[1] zeMemAllocHost -> ZE_RESULT_SUCCESS ; zeMemGetIpcHandle(host) -> ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+    dev[1] zexMemGetIpcHandles: query=ZE_RESULT_ERROR_UNSUPPORTED_FEATURE n=0 get=ZE_RESULT_ERROR_UNSUPPORTED_FEATURE
+
+[6] counter-based events (zex): symbol availability + IPC variants
+    zexCounterBasedEventCreate2 : via zeDriverGetExtensionFunctionAddress
+    zexCounterBasedEventGetIpcHandle : via zeDriverGetExtensionFunctionAddress
+    zexCounterBasedEventOpenIpcHandle : via zeDriverGetExtensionFunctionAddress
+    zexCounterBasedEventCloseIpcHandle : via zeDriverGetExtensionFunctionAddress
+      create2 flags=0x5 (local) -> ZE_RESULT_SUCCESS ev=True
+      local smoke: preQuery(0ns)=ZE_RESULT_SUCCESS signal=ZE_RESULT_ERROR_UNSUPPORTED_FEATURE postQuery=ZE_RESULT_SUCCESS
+      create2 flags=0xD (IMMEDIATE|HOST_VISIBLE|IPC) -> ZE_RESULT_SUCCESS ev=True
+      GetIpcHandle -> ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
+      create2 flags=0xE (NON_IMMEDIATE|HOST_VISIBLE|IPC) -> ZE_RESULT_SUCCESS ev=True
+      GetIpcHandle -> ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
+      create2 flags=0x8 (IPC only) -> ZE_RESULT_SUCCESS ev=True
+      GetIpcHandle -> ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY
+
+[7] cleanup
+    zeMemFree dev[0] -> ZE_RESULT_SUCCESS
+    zeContextDestroy dev[0] -> ZE_RESULT_SUCCESS
+    zeMemFree dev[1] -> ZE_RESULT_SUCCESS
+    zeContextDestroy dev[1] -> ZE_RESULT_SUCCESS
+
+done.
