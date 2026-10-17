@@ -4,7 +4,7 @@
 ## Управление
 | Поле | Значение |
 |---|---|
-| Ветка | feature/gpu-tensor-parallel (активна с S01, запушена в origin) |
+| Ветка | feature/gpu-tensor-parallel (активна с S01; push 403 — ждёт gh auth login) |
 | Upstream tip базис | 85720fe2 (2026-10-17) |
 | ОС / железо | Windows primary; 2+ Intel Arc/BMG |
 | Тест-модель | models/Qwen3.5-9B-int4-ov (полная, кроме openvino_mtp_model.*) |
@@ -13,7 +13,7 @@
 ## Прогресс сессий
 - [x] Планирование (2026-10-17, PLAN.md готов)
 - [x] Базовая инициализация репо (2026-10-17): remotes origin/upstream, shallow-fetch tip 85720fe2, commit 6339e518 (PLAN/STATE/NEXT/.gitignore) запушен в origin master
-- [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit "S01: project init notes + S02 prompt"
+- [x] S01 init (2026-10-17): ветка feature/gpu-tensor-parallel от master; docs/notes/{cpu-tp-pattern,gpu-plugin-arch,hetero-pp,l0-spike-plan}.md; STATE обновлён; NEXT — промпт S02; commit 7bd6c6d4 (push 403 — ждёт авторизацию, см. Блокеры)
 - [ ] S02 L0-спайк A
 - [ ] S03 L0-спайк B (G0)
 - [ ] S04 Stage1.1 TPCoordinator
@@ -33,9 +33,14 @@
 ## Гейт-решения (журнал)
 | Дата | Гейт | Решение | Обоснование |
 |---|---|---|---|
-| 2026-10-17 | S01 init | done (GATE пройден) | ветка активна и запушена; 4 конспекта в docs/notes на уровне PLAN §3; STATE/NEXT обновлены (критерии PLAN §5 S01) |
+| 2026-10-17 | S01 init | done, кроме push (403) | артефакты GATE готовы: ветка активна, 4 конспекта в docs/notes, STATE/NEXT обновлены; критерий «запушена» отложен до `gh auth login` |
 
 ## Блокеры / открытые вопросы
+- S01 push: `git push -u origin feature/gpu-tensor-parallel` → **403** "Permission to
+  savvadesogle/openvino.git denied to savvadesogle". Нужно: пользователю выполнить
+  `gh auth login` с доступом на запись к origin (или обновить credentials/PAT с
+  правами contents:write; НЕ присылать токен текстом в чат). Локально закоммичено:
+  7bd6c6d4 (S01) + этот STATE-коммит; после авторизации — повторить push.
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
