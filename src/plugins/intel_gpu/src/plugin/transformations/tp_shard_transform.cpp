@@ -19,6 +19,13 @@
 //    boundaries: N-split keeps whole out-channel chunks, K-split keeps whole groups (K multiple of
 //    group_size * num_ranks). Sub-byte (u4/i4) slices are byte-aligned or the node falls back to
 //    REPLICA. See docs/notes/int4-asym-weights.md.
+//  - S10: state (ReadValue/Assign). Variables whose state is a static, head-split tensor and whose
+//    whole ReadValue -> (element-wise / broadcast) -> Assign chain is head-local are turned into
+//    HEAD_SHARDED variables: each rank's variable shape is reduced to full_dim / num_ranks along the
+//    head axis, and TPInferRequest concatenates the per-rank states back on query_state() (and
+//    scatters on set_state()). Everything else (dynamic shapes, non-head-local chains - e.g. the
+//    Qwen3.5 SDPA KV cache and the linear-attention conv/ssm states) stays REPLICATED (rank 0
+//    authoritative). See docs/notes/state-inventory.md and PLAN §4.3/§5 (S10).
 // See PLAN.md §2, §4.2, §4.3, §7.4.
 
 #include "tp_shard_transform.hpp"
@@ -67,6 +74,9 @@
 #include "openvino/op/subtract.hpp"
 #include "openvino/op/swish.hpp"
 #include "openvino/op/tanh.hpp"
+#include "openvino/op/util/assign_base.hpp"
+#include "openvino/op/util/read_value_base.hpp"
+#include "openvino/op/util/variable.hpp"
 
 namespace ov::intel_gpu {
 
@@ -850,6 +860,187 @@ bool apply_ksplit_quantized(const QuantizedWeight& qw, int64_t offset_g, int64_t
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// [S10] State (ReadValue/Assign) head-sharding analysis. See docs/notes/state-inventory.md.
+// ---------------------------------------------------------------------------------------------
+
+//! Preferred head axis of a state tensor: the axis adjacent to the innermost one (per-head layout
+//! [.., H, hd], e.g. the KV cache [batch, kv_heads, seq, head_dim]); falls back to the first
+//! divisible interior axis. Returns -1 when no divisible interior axis exists.
+int64_t find_state_head_axis(const ov::Shape& shape, int32_t num_ranks) {
+    const int64_t rank = static_cast<int64_t>(shape.size());
+    if (rank < 2 || num_ranks <= 1) {
+        return -1;
+    }
+    auto divisible = [&](int64_t a) {
+        return a >= 1 && a <= rank - 2 && shape[a] > 1 && (shape[a] % static_cast<size_t>(num_ranks) == 0);
+    };
+    const int64_t preferred = rank - 2;
+    if (divisible(preferred)) {
+        return preferred;
+    }
+    for (int64_t a = 1; a <= rank - 2; ++a) {
+        if (divisible(a)) {
+            return a;
+        }
+    }
+    return -1;
+}
+
+//! True when an operand of an element-wise node may keep its shape when the state head axis is
+//! reduced to full_dim / num_ranks, i.e. it broadcasts along that axis.
+bool operand_broadcasts_at_axis(const ov::PartialShape& pshape, int64_t axis) {
+    if (pshape.rank().is_dynamic()) {
+        return false;
+    }
+    const int64_t r = pshape.rank().get_length();
+    if (r <= axis) {
+        return true;  // right-aligned: no dimension on the head axis -> broadcast
+    }
+    const auto& dim = pshape[axis];
+    return dim.is_static() && dim.get_length() == 1;
+}
+
+//! Result of analyzing one state variable for head-sharding.
+struct StateShardAnalysis {
+    bool safe = false;
+    int64_t axis = -1;
+    int64_t full_dim = -1;
+    ov::Shape full_shape;
+    std::vector<size_t> derived_results;  // model output indices reachable via element-wise ops
+    std::string reason;
+};
+
+//! State variable id of a ReadValue/Assign node ("" for other nodes).
+std::string state_variable_id(const std::shared_ptr<ov::Node>& node) {
+    if (auto rv = ov::as_type_ptr<ov::op::util::ReadValueBase>(node)) {
+        return rv->get_variable_id();
+    }
+    if (auto as = ov::as_type_ptr<ov::op::util::AssignBase>(node)) {
+        return as->get_variable_id();
+    }
+    return {};
+}
+
+//! Analyzes whether @p var can be head-sharded: static, numeric, divisible head axis, and a chain
+//! ReadValue -> (element-wise/broadcast) -> Assign that is entirely head-local.
+StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Variable>& var,
+                                          const std::vector<std::shared_ptr<ov::Node>>& read_values,
+                                          const std::vector<std::shared_ptr<ov::Node>>& assigns,
+                                          const std::unordered_map<const ov::Node*, size_t>& result_index,
+                                          int32_t num_ranks) {
+    StateShardAnalysis a;
+    const auto info = var->get_info();
+    if (!info.data_shape.is_static()) {
+        a.reason = "dynamic state shape";
+        return a;
+    }
+    if (info.data_type.is_dynamic() || info.data_type == ov::element::string ||
+        info.data_type == ov::element::boolean) {
+        a.reason = "non-numeric state type";
+        return a;
+    }
+    a.full_shape = info.data_shape.to_shape();
+    a.axis = find_state_head_axis(a.full_shape, num_ranks);
+    if (a.axis < 0) {
+        a.reason = "head axis not divisible by num_ranks";
+        return a;
+    }
+    a.full_dim = static_cast<int64_t>(a.full_shape[a.axis]);
+
+    // A ReadValue may carry an initialization subgraph; its value must broadcast along the head
+    // axis so the (sharded) variable shape still relaxes it. Otherwise the state stays replicated.
+    for (const auto& rv : read_values) {
+        if (rv->get_input_size() > 0 && !operand_broadcasts_at_axis(rv->get_input_partial_shape(0), a.axis)) {
+            a.reason = "non-broadcast ReadValue initializer on head axis";
+            return a;
+        }
+    }
+
+    const std::string target_id = info.variable_id;
+    std::unordered_set<const ov::Node*> reachable;
+    std::vector<std::shared_ptr<ov::Node>> work;
+    std::vector<std::shared_ptr<ov::Node>> elementwise_nodes;
+    for (const auto& rv : read_values) {
+        reachable.insert(rv.get());
+        work.push_back(rv);
+    }
+    std::unordered_set<const ov::Node*> covered_assigns;
+    while (!work.empty()) {
+        auto cur = work.back();
+        work.pop_back();
+        for (size_t oi = 0; oi < cur->get_output_size(); ++oi) {
+            for (const auto& target : cur->output(oi).get_target_inputs()) {
+                auto consumer = target.get_node()->shared_from_this();
+                if (auto res = ov::as_type_ptr<ov::op::v0::Result>(consumer)) {
+                    auto it = result_index.find(res.get());
+                    if (it != result_index.end()) {
+                        a.derived_results.push_back(it->second);
+                    }
+                    continue;
+                }
+                if (ov::is_type<ov::op::util::AssignBase>(consumer)) {
+                    if (state_variable_id(consumer) != target_id) {
+                        a.reason = "Assign of a different variable in chain";
+                        return a;
+                    }
+                    covered_assigns.insert(consumer.get());
+                    continue;
+                }
+                if (!is_elementwise(consumer)) {
+                    a.reason = "non-element-wise state consumer";
+                    return a;
+                }
+                if (reachable.insert(consumer.get()).second) {
+                    work.push_back(consumer);
+                    elementwise_nodes.push_back(consumer);
+                }
+            }
+        }
+    }
+    // Second pass: every operand of every reached element-wise node must be a matching ReadValue,
+    // another reached node, or broadcast along the head axis.
+    for (const auto& n : elementwise_nodes) {
+        for (const auto& iv : n->input_values()) {
+            auto producer = iv.get_node_shared_ptr();
+            if (ov::is_type<ov::op::util::ReadValueBase>(producer)) {
+                if (state_variable_id(producer) != target_id) {
+                    a.reason = "state chain mixes variables";
+                    return a;
+                }
+                continue;
+            }
+            if (reachable.count(producer.get())) {
+                continue;
+            }
+            if (!operand_broadcasts_at_axis(producer->get_output_partial_shape(iv.get_index()), a.axis)) {
+                a.reason = "non-broadcast operand on head axis";
+                return a;
+            }
+        }
+    }
+    for (const auto& as : assigns) {
+        if (!covered_assigns.count(as.get())) {
+            a.reason = "Assign not fed by matching ReadValue";
+            return a;
+        }
+    }
+    std::sort(a.derived_results.begin(), a.derived_results.end());
+    a.derived_results.erase(std::unique(a.derived_results.begin(), a.derived_results.end()),
+                            a.derived_results.end());
+    a.safe = true;
+    return a;
+}
+
+//! A model output that is produced by a HEAD_SHARDED state chain (all-gather along @p axis).
+struct StateOutputSeam {
+    size_t output_index = 0;
+    int64_t axis = -1;
+    int64_t full_dim = -1;
+    int64_t full_rank = 0;
+    std::string variable_id;
+};
+
 }  // namespace
 
 bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
@@ -1084,6 +1275,102 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
         seams.push_back(std::move(seam));
     }
 
+    // [S10] State (ReadValue/Assign) head-sharding. Must run after the GEMM pass so that the
+    // final graph (weights sliced, activations sliced) is what gets validated. A state variable is
+    // head-sharded only when it is static, numeric, its head axis is divisible and the whole
+    // ReadValue -> (element-wise/broadcast) -> Assign chain stays head-local; otherwise it is
+    // reported REPLICATED (rank 0 authoritative) with a diagnostic reason.
+    std::vector<TPStateSeam> state_seams;
+    std::vector<StateOutputSeam> state_output_seams;
+    if (sharding_active) {
+        struct VarGroup {
+            std::shared_ptr<ov::op::util::Variable> var;
+            std::vector<std::shared_ptr<ov::Node>> read_values;
+            std::vector<std::shared_ptr<ov::Node>> assigns;
+        };
+        std::unordered_map<std::string, VarGroup> var_groups;
+        for (const auto& node : model->get_ordered_ops()) {
+            if (auto rv = ov::as_type_ptr<ov::op::util::ReadValueBase>(node)) {
+                auto var = rv->get_variable();
+                if (!var) {
+                    continue;
+                }
+                auto& g = var_groups[var->get_info().variable_id];
+                g.var = var;
+                g.read_values.push_back(node);
+            }
+        }
+        for (const auto& sink : model->get_sinks()) {
+            if (auto as = ov::as_type_ptr<ov::op::util::AssignBase>(sink)) {
+                auto var = as->get_variable();
+                if (!var) {
+                    continue;
+                }
+                auto& g = var_groups[var->get_info().variable_id];
+                g.var = var;
+                g.assigns.push_back(as);
+            }
+        }
+
+        std::unordered_map<const ov::Node*, size_t> result_index;
+        {
+            const auto results = model->get_results();
+            for (size_t i = 0; i < results.size(); ++i) {
+                result_index[results[i].get()] = i;
+            }
+        }
+
+        std::vector<std::string> ids;
+        ids.reserve(var_groups.size());
+        for (const auto& kv : var_groups) {
+            ids.push_back(kv.first);
+        }
+        std::sort(ids.begin(), ids.end());
+
+        bool state_modified = false;
+        for (const auto& id : ids) {
+            auto& g = var_groups[id];
+            auto analysis = analyze_state_variable(g.var, g.read_values, g.assigns, result_index, m_num_ranks);
+            TPStateSeam ss;
+            ss.variable_id = id;
+            if (!analysis.safe) {
+                ss.kind = TPStateShardKind::REPLICATED;
+                ss.reason = analysis.reason;
+                GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform state " << id << " -> REPLICATED ("
+                               << analysis.reason << ")" << std::endl;
+                state_seams.push_back(std::move(ss));
+                continue;
+            }
+            ss.kind = TPStateShardKind::HEAD_SHARDED;
+            ss.axis = analysis.axis;
+            ss.full_dim = analysis.full_dim;
+            ss.full_shape = analysis.full_shape;
+            ss.reason = "head-local element-wise state chain";
+            auto sharded = analysis.full_shape;
+            sharded[analysis.axis] = sharded[analysis.axis] / static_cast<size_t>(m_num_ranks);
+            g.var->update_data_shape(ov::PartialShape(sharded));
+            for (size_t oi : analysis.derived_results) {
+                StateOutputSeam so;
+                so.output_index = oi;
+                so.axis = analysis.axis;
+                so.full_dim = analysis.full_dim;
+                so.full_rank = static_cast<int64_t>(analysis.full_shape.size());
+                so.variable_id = id;
+                state_output_seams.push_back(std::move(so));
+            }
+            state_modified = true;
+            GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform state " << id << " -> HEAD_SHARDED axis="
+                           << analysis.axis << " full_dim=" << analysis.full_dim << " shard="
+                           << sharded[analysis.axis] << " derived_outputs=" << analysis.derived_results.size()
+                           << std::endl;
+            state_seams.push_back(std::move(ss));
+        }
+        if (state_modified) {
+            model->validate_nodes_and_infer_types();
+            graph_modified = true;
+        }
+    }
+
     // Model outputs that are produced by a sliced GEMM (possibly through purely element-wise
     // ops) require assembly on rank 0: all-gather (N-split) or all-reduce(sum) (K-split).
     // ov::Model::outputs() exposes the Results in get_results() order, so the result index
@@ -1131,11 +1418,38 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
         }
     }
 
+    // [S10] Outputs fed by a HEAD_SHARDED state chain also need all-gather (concatenation) along
+    // the head axis (unless a sliced GEMM already claimed the same output).
+    for (const auto& so : state_output_seams) {
+        bool already = false;
+        for (const auto& os : output_seams) {
+            if (os.output_index == so.output_index) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            continue;
+        }
+        TPOutputSeam os;
+        os.output_index = so.output_index;
+        os.collective = TPCollectiveKind::ALL_GATHER;
+        // Negative axis counted from the end (consistent with the N-split last-axis encoding).
+        os.split_axis = so.axis - so.full_rank;
+        os.shard_dim_size = so.full_dim;
+        os.producer_node = "state:" + so.variable_id;
+        GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform output[" << so.output_index << "]: "
+                       << tp_output_seam_to_string(os) << std::endl;
+        output_seams.push_back(std::move(os));
+    }
+
     GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform detected " << seams.size() << " candidate node(s), sliced "
-                   << sliced_nodes.size() << ", assembly outputs " << output_seams.size() << std::endl;
+                   << sliced_nodes.size() << ", assembly outputs " << output_seams.size() << ", state seams "
+                   << state_seams.size() << std::endl;
 
     set_tp_seams(model, std::move(seams));
     set_tp_output_seams(model, std::move(output_seams));
+    set_tp_state_seams(model, std::move(state_seams));
     return graph_modified;
 }
 

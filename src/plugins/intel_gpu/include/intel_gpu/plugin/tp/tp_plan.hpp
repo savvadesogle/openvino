@@ -1,12 +1,14 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S06/S07/S08] Experimental GPU tensor-parallel support.
+// [TP-GPU, S04/S06/S07/S08/S10] Experimental GPU tensor-parallel support.
 // Minimal tensor-parallel plan produced at compile time by the TPCoordinator.
 // S06 adds seam detection: TPShardTransform classifies MatMul/FullyConnected nodes and the
 // coordinator collects them into TPPlan.seams. S07 adds N-split weight slicing + all-gather
 // output seams. S08 adds K-split weight/activation slicing + all-reduce(sum) output seams
 // (fp32 accumulation; replicated bias/residual terms are added once by the reducer).
+// S10 adds state-variable sharding (TPStateSeam): static, head-local state is head-sharded per
+// rank and aggregated by TPInferRequest; everything else stays replicated.
 // See PLAN.md §4.2, §4.3, §4.4, §7.4.
 
 #pragma once
@@ -124,12 +126,45 @@ struct TPOutputSeam {
 };
 
 /**
+ * @brief How a stateful variable (attention KV cache / recurrent state) is distributed across
+ * tensor-parallel ranks (S10). PLAN §4.3.
+ */
+enum class TPStateShardKind : uint8_t {
+    REPLICATED = 0,  //!< identical state on every rank; aggregation = rank-0 copy
+    HEAD_SHARDED,    //!< state split along a head axis; aggregation = concatenation along that axis
+};
+
+/**
+ * @brief Describes how a single model state variable (ReadValue/Assign) is distributed.
+ *
+ * For HEAD_SHARDED variables each rank keeps a contiguous `[axis] = full_dim / num_ranks` slice
+ * of the (static) state; TPInferRequest::query_state() concatenates the per-rank slices back into
+ * the full state along @p axis, and set_state()/reset() distribute accordingly. REPLICATED state
+ * is left untouched (rank 0 authoritative). See docs/notes/state-inventory.md.
+ */
+struct TPStateSeam {
+    //! ov::op::util::VariableInfo::variable_id (also the runtime IVariableState name).
+    std::string variable_id;
+    //! Sharding kind.
+    TPStateShardKind kind = TPStateShardKind::REPLICATED;
+    //! Head axis of the FULL state shape (non-negative index); -1 for REPLICATED.
+    int64_t axis = -1;
+    //! Size of the head axis in the FULL (unsharded) state; -1 for REPLICATED.
+    int64_t full_dim = -1;
+    //! Full (unsharded) state shape (used to validate/extract per-rank slices).
+    ov::Shape full_shape;
+    //! Human-readable reason (debug/introspection): why replicated or head-sharded.
+    std::string reason;
+};
+
+/**
  * @brief Compile-time tensor-parallel plan.
  *
  * Describes the participating ranks (and their device ids), the classified seams detected by
  * TPShardTransform and the model outputs that require a collective to be assembled on rank 0
- * (all-gather for N-split, all-reduce sum for K-split, S07/S08). The structure is deliberately
- * minimal so that later stages can extend it without touching the public API.
+ * (all-gather for N-split, all-reduce sum for K-split, S07/S08) plus the state-variable sharding
+ * decisions (S10). The structure is deliberately minimal so that later stages can extend it
+ * without touching the public API.
  */
 struct TPPlan {
     //! Rank indices, e.g. {0, 1} for a 2-GPU TP group.
@@ -141,6 +176,8 @@ struct TPPlan {
     std::vector<TPSeam> seams;
     //! Model outputs that must be assembled from per-rank slices (all-gather, S07).
     std::vector<TPOutputSeam> output_seams;
+    //! State variables and their sharding (S10), in deterministic variable-id order.
+    std::vector<TPStateSeam> state_seams;
 
     bool tp_enabled() const { return ranks.size() > 1; }
     size_t num_ranks() const { return ranks.size(); }
@@ -148,6 +185,8 @@ struct TPPlan {
     size_t num_sharded_seams() const;
     //! Finds the assembly descriptor for a model output index (nullptr if it is replicated).
     const TPOutputSeam* find_output_seam(size_t output_index) const;
+    //! Finds the sharding descriptor for a state variable id (nullptr if unknown/replicated).
+    const TPStateSeam* find_state_seam(const std::string& variable_id) const;
 };
 
 //! Stable string encodings used for logging and for the ov::intel_gpu::tp_seams property.
@@ -167,6 +206,9 @@ const char* tp_output_seams_rt_info_key();
 //! Encodes an output seam as "<producer>:<split_axis>:<shard_dim_size>" (logging/introspection).
 std::string tp_output_seam_to_string(const TPOutputSeam& seam);
 
+//! Encodes a state seam as "<kind>:<axis>:<full_dim>:<variable_id>" (logging/introspection).
+std::string tp_state_seam_to_string(const TPStateSeam& seam);
+
 //! Stores the detected seams in the model rt_info (used by TPShardTransform).
 void set_tp_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPSeam> seams);
 //! Reads the seams previously stored by TPShardTransform (empty if none / non-TP model).
@@ -176,5 +218,10 @@ std::vector<TPSeam> get_tp_seams(const std::shared_ptr<const ov::Model>& model);
 void set_tp_output_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPOutputSeam> seams);
 //! Reads the all-gather outputs previously stored by TPShardTransform (empty if none).
 std::vector<TPOutputSeam> get_tp_output_seams(const std::shared_ptr<const ov::Model>& model);
+
+//! [S10] Stores the detected state-variable sharding in the model rt_info (used by TPShardTransform).
+void set_tp_state_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPStateSeam> seams);
+//! [S10] Reads the state-variable sharding previously stored by TPShardTransform (empty if none).
+std::vector<TPStateSeam> get_tp_state_seams(const std::shared_ptr<const ov::Model>& model);
 
 }  // namespace ov::intel_gpu

@@ -15,6 +15,10 @@
 // contraction (K) axis AND the activation operand along its last axis so each rank computes
 // a partial GEMM sum, and records the model outputs that must be all-reduced (summed) on
 // rank 0. Replicated bias/residual terms are recorded so the reducer adds them once.
+// S10 analyses model state (ReadValue/Assign): static, head-local state variables are
+// head-sharded (variable shape reduced along the head axis per rank) and recorded in
+// ov::intel_gpu::tp_state_seams_rt_info_key() so TPInferRequest can aggregate them; all other
+// variables (dynamic shapes, non-element-wise chains) stay replicated.
 // See PLAN.md §4.2, §4.3, §7.4.
 
 #pragma once

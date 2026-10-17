@@ -1,14 +1,16 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05/S07/S08] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S07/S08/S10] Experimental GPU tensor-parallel support.
 // TPInferRequest drives k per-rank inference requests (one per device).
 //  - S05: replicated graph, inputs replicated to every rank, rank-0 outputs;
 //  - S07: N-split ranks produce only their output-channel slice; rank-0 outputs marked as
 //    all-gather are assembled on the host from the per-rank slices (concatenation, no
 //    arithmetic);
 //  - S08: K-split ranks produce a partial GEMM sum; rank-0 outputs marked as all-reduce are
-//    summed in fp32 and the replicated bias/residual terms are added exactly once.
+//    summed in fp32 and the replicated bias/residual terms are added exactly once;
+//  - S10: head-sharded state variables are aggregated from the per-rank slices on
+//    query_state()/get_state() and scattered back on set_state().
 // See PLAN.md §4.3, §4.4, §7.4.
 
 #include "intel_gpu/plugin/tp/tp_infer_request.hpp"
@@ -28,6 +30,7 @@
 #include "openvino/core/type/bfloat16.hpp"
 #include "openvino/core/type/float16.hpp"
 #include "openvino/runtime/iremote_tensor.hpp"
+#include "openvino/runtime/ivariable_state.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 
 namespace {
@@ -57,30 +60,36 @@ void copy_host_tensor(const ov::SoPtr<ov::ITensor>& src,
     std::memcpy(dst->data(), src->data(), bytes);
 }
 
-// [S07] Copies the last-axis slice [offset, offset + count) of @p src into @p dst at the same
-// position - the all-gather concatenation primitive (no arithmetic). @p src must be shaped
-// like @p dst with the last dimension equal to @p count.
-void copy_last_axis_region(const ov::SoPtr<ov::ITensor>& src,
-                           const ov::SoPtr<ov::ITensor>& dst,
-                           size_t offset,
-                           size_t count) {
+// [S07/S10] Copies the slice [offset, offset + count) along @p axis of @p src into @p dst at the
+// same position - the all-gather concatenation primitive (no arithmetic). @p src must be shaped
+// like @p dst with dimension @p axis equal to @p count. Generalizes the S07 last-axis helper so
+// head-sharded state outputs (split along an interior axis) assemble the same way.
+void copy_axis_region(const ov::SoPtr<ov::ITensor>& src,
+                      const ov::SoPtr<ov::ITensor>& dst,
+                      size_t axis,
+                      size_t offset,
+                      size_t count) {
     OPENVINO_ASSERT(src && dst, "[GPU][TP] Cannot assemble output: null tensor");
     OPENVINO_ASSERT(std::dynamic_pointer_cast<ov::IRemoteTensor>(src._ptr) == nullptr &&
                         std::dynamic_pointer_cast<ov::IRemoteTensor>(dst._ptr) == nullptr,
                     "[GPU][TP] Host assembly of device (remote) tensors is not supported yet (S07)");
 
     const auto full_shape = dst->get_shape();
-    OPENVINO_ASSERT(!full_shape.empty(), "[GPU][TP] Cannot assemble a scalar output");
     const auto src_shape = src->get_shape();
-    OPENVINO_ASSERT(src_shape.size() == full_shape.size() && src_shape.back() == count,
+    OPENVINO_ASSERT(axis < full_shape.size(), "[GPU][TP] Cannot assemble along axis ", axis);
+    OPENVINO_ASSERT(src_shape.size() == full_shape.size() && src_shape[axis] == count,
                     "[GPU][TP] Unexpected rank slice shape ", src_shape, " for full shape ", full_shape);
-    OPENVINO_ASSERT(offset + count <= full_shape.back(), "[GPU][TP] All-gather region out of bounds");
+    OPENVINO_ASSERT(offset + count <= full_shape[axis], "[GPU][TP] All-gather region out of bounds");
 
     size_t outer = 1;
-    for (size_t i = 0; i + 1 < full_shape.size(); ++i) {
+    for (size_t i = 0; i < axis; ++i) {
         outer *= full_shape[i];
     }
-    const size_t axis_dim = full_shape.back();
+    size_t inner = 1;
+    for (size_t i = axis + 1; i < full_shape.size(); ++i) {
+        inner *= full_shape[i];
+    }
+    const size_t axis_dim = full_shape[axis];
 
     const auto et = dst->get_element_type();
     if (et == ov::element::string) {
@@ -88,18 +97,69 @@ void copy_last_axis_region(const ov::SoPtr<ov::ITensor>& src,
         auto* d = dst->data<std::string>();
         for (size_t o = 0; o < outer; ++o) {
             for (size_t j = 0; j < count; ++j) {
-                d[o * axis_dim + offset + j] = s[o * count + j];
+                for (size_t k = 0; k < inner; ++k) {
+                    d[(o * axis_dim + offset + j) * inner + k] = s[(o * count + j) * inner + k];
+                }
             }
         }
         return;
     }
 
     const size_t elem_bytes = et.size();
-    const size_t row_bytes = count * elem_bytes;
+    const size_t slab_bytes = count * inner * elem_bytes;
     const auto* s = static_cast<const uint8_t*>(src->data());
     auto* d = static_cast<uint8_t*>(dst->data());
     for (size_t o = 0; o < outer; ++o) {
-        std::memcpy(d + (o * axis_dim + offset) * elem_bytes, s + o * row_bytes, row_bytes);
+        std::memcpy(d + (o * axis_dim + offset) * inner * elem_bytes, s + o * slab_bytes, slab_bytes);
+    }
+}
+
+// [S10] Inverse of copy_axis_region: copies the region [offset, offset + count) along @p axis of
+// the full @p src into the (axis cut to @p count) @p dst. Used to scatter a full state back to the
+// per-rank slices on set_state().
+void extract_axis_region(const ov::SoPtr<ov::ITensor>& src,
+                         const ov::SoPtr<ov::ITensor>& dst,
+                         size_t axis,
+                         size_t offset,
+                         size_t count) {
+    OPENVINO_ASSERT(src && dst, "[GPU][TP] Cannot set state: null tensor");
+    const auto full_shape = src->get_shape();
+    const auto dst_shape = dst->get_shape();
+    OPENVINO_ASSERT(axis < full_shape.size(), "[GPU][TP] Cannot scatter along axis ", axis);
+    OPENVINO_ASSERT(dst_shape.size() == full_shape.size() && dst_shape[axis] == count,
+                    "[GPU][TP] Unexpected state slice shape ", dst_shape, " for full shape ", full_shape);
+    OPENVINO_ASSERT(offset + count <= full_shape[axis], "[GPU][TP] State scatter region out of bounds");
+
+    size_t outer = 1;
+    for (size_t i = 0; i < axis; ++i) {
+        outer *= full_shape[i];
+    }
+    size_t inner = 1;
+    for (size_t i = axis + 1; i < full_shape.size(); ++i) {
+        inner *= full_shape[i];
+    }
+    const size_t axis_dim = full_shape[axis];
+
+    const auto et = dst->get_element_type();
+    if (et == ov::element::string) {
+        auto* s = src->data<std::string>();
+        auto* d = dst->data<std::string>();
+        for (size_t o = 0; o < outer; ++o) {
+            for (size_t j = 0; j < count; ++j) {
+                for (size_t k = 0; k < inner; ++k) {
+                    d[(o * count + j) * inner + k] = s[(o * axis_dim + offset + j) * inner + k];
+                }
+            }
+        }
+        return;
+    }
+
+    const size_t elem_bytes = et.size();
+    const size_t slab_bytes = count * inner * elem_bytes;
+    const auto* s = static_cast<const uint8_t*>(src->data());
+    auto* d = static_cast<uint8_t*>(dst->data());
+    for (size_t o = 0; o < outer; ++o) {
+        std::memcpy(d + o * slab_bytes, s + (o * axis_dim + offset) * inner * elem_bytes, slab_bytes);
     }
 }
 
@@ -201,6 +261,83 @@ void accumulate_scaled_broadcast(std::vector<float>& acc,
     }
 }
 
+// [S10] Aggregates one logical state variable across the k ranks. For HEAD_SHARDED variables the
+// per-rank states hold disjoint head-axis slices, so get_state() concatenates them into the full
+// state and set_state() scatters a full state back into the per-rank slices. REPLICATED variables
+// (the common case - dynamic / non-head-local chains) are rank-0 authoritative: get_state()
+// returns rank 0 and reset()/set_state() fan out to every rank so ranks stay in sync.
+class TPAggregatedState : public ov::IVariableState {
+public:
+    TPAggregatedState(const std::string& name,
+                      std::vector<ov::SoPtr<ov::IVariableState>> ranks,
+                      ov::intel_gpu::TPStateShardKind kind,
+                      int64_t axis,
+                      ov::Shape full_shape)
+        : ov::IVariableState(name),
+          m_ranks(std::move(ranks)),
+          m_kind(kind),
+          m_axis(axis),
+          m_full_shape(std::move(full_shape)) {}
+
+    void reset() override {
+        for (auto& s : m_ranks) {
+            if (s) {
+                s->reset();
+            }
+        }
+    }
+
+    void set_state(const ov::SoPtr<ov::ITensor>& state) override {
+        OPENVINO_ASSERT(state, "[GPU][TP] Cannot set a null state tensor for ", m_name);
+        if (m_kind != ov::intel_gpu::TPStateShardKind::HEAD_SHARDED || m_ranks.size() <= 1) {
+            for (auto& s : m_ranks) {
+                if (s) {
+                    s->set_state(state);
+                }
+            }
+            return;
+        }
+        const size_t axis = static_cast<size_t>(m_axis);
+        OPENVINO_ASSERT(axis < m_full_shape.size(), "[GPU][TP] Invalid head axis for state ", m_name);
+        const size_t count = m_full_shape[axis] / m_ranks.size();
+        for (size_t r = 0; r < m_ranks.size(); ++r) {
+            if (!m_ranks[r]) {
+                continue;
+            }
+            auto part_shape = m_full_shape;
+            part_shape[axis] = count;
+            auto slice = ov::SoPtr<ov::ITensor>(ov::make_tensor(state->get_element_type(), part_shape), nullptr);
+            extract_axis_region(state, slice, axis, r * count, count);
+            m_ranks[r]->set_state(slice);
+        }
+    }
+
+    ov::SoPtr<ov::ITensor> get_state() const override {
+        if (m_kind != ov::intel_gpu::TPStateShardKind::HEAD_SHARDED || m_ranks.size() <= 1) {
+            return m_ranks.front() ? m_ranks.front()->get_state() : ov::SoPtr<ov::ITensor>{};
+        }
+        auto first = m_ranks.front()->get_state();
+        OPENVINO_ASSERT(first, "[GPU][TP] Rank 0 returned a null state for ", m_name);
+        auto full = ov::SoPtr<ov::ITensor>(ov::make_tensor(first->get_element_type(), m_full_shape), nullptr);
+        const size_t axis = static_cast<size_t>(m_axis);
+        const size_t count = m_full_shape[axis] / m_ranks.size();
+        for (size_t r = 0; r < m_ranks.size(); ++r) {
+            if (!m_ranks[r]) {
+                continue;
+            }
+            auto part = m_ranks[r]->get_state();
+            copy_axis_region(part, full, axis, r * count, count);
+        }
+        return full;
+    }
+
+private:
+    std::vector<ov::SoPtr<ov::IVariableState>> m_ranks;
+    ov::intel_gpu::TPStateShardKind m_kind;
+    int64_t m_axis;
+    ov::Shape m_full_shape;
+};
+
 }  // namespace
 
 namespace ov::intel_gpu {
@@ -276,15 +413,20 @@ void TPInferRequest::assemble_outputs() {
         if (sharded && seam->collective == TPCollectiveKind::ALL_REDUCE_SUM) {
             // [S08] K-split: sum the per-rank partial GEMM outputs (fp32, all-reduce sum).
             assemble_reduce_sum(i, *seam);
-        } else if (sharded && seam->collective == TPCollectiveKind::ALL_GATHER &&
-                   seam->shard_dim_size > 0 && seam->split_axis <= -1) {
-            // All-gather: concatenate each rank's slice along the last (N) axis.
+        } else if (sharded && seam->collective == TPCollectiveKind::ALL_GATHER && seam->shard_dim_size > 0) {
+            // All-gather: concatenate each rank's slice along the split axis (last axis for
+            // N-split GEMM outputs, an interior head axis for head-sharded state outputs, S10).
             const auto full_shape = dst->get_shape();
-            const size_t count = full_shape.back() / num_ranks;
+            OPENVINO_ASSERT(!full_shape.empty(), "[GPU][TP] Cannot assemble a scalar output");
+            const int64_t full_rank = static_cast<int64_t>(full_shape.size());
+            const int64_t axis_i = seam->split_axis < 0 ? full_rank + seam->split_axis : seam->split_axis;
+            OPENVINO_ASSERT(axis_i >= 0 && axis_i < full_rank, "[GPU][TP] Invalid all-gather axis ", seam->split_axis);
+            const size_t axis = static_cast<size_t>(axis_i);
+            const size_t count = full_shape[axis] / num_ranks;
             for (size_t r = 0; r < num_ranks; ++r) {
                 auto rank_port = m_rank_requests[r]->get_outputs().at(i);
                 auto src = m_rank_requests[r]->get_tensor(rank_port);
-                copy_last_axis_region(src, dst, r * count, count);
+                copy_axis_region(src, dst, axis, r * count, count);
             }
         } else {
             // Replicated output: rank 0 is authoritative.
@@ -406,8 +548,63 @@ std::vector<ov::ProfilingInfo> TPInferRequest::get_profiling_info() const {
 }
 
 std::vector<ov::SoPtr<ov::IVariableState>> TPInferRequest::query_state() const {
-    // Per-rank state aggregation (KV + linear-attention) is implemented in S10/S11.
-    return m_rank_requests.front()->query_state();
+    // [S10] Aggregate the per-rank state variables. HEAD_SHARDED variables are concatenated along
+    // their head axis; REPLICATED variables are rank-0 authoritative but reset/set_state fan out.
+    const auto compiled = std::static_pointer_cast<const TPCompiledModel>(get_compiled_model());
+    const auto& plan = compiled->get_tp_plan();
+    const auto num_ranks = m_rank_requests.size();
+
+    std::vector<std::vector<ov::SoPtr<ov::IVariableState>>> all_states;
+    all_states.reserve(num_ranks);
+    for (const auto& request : m_rank_requests) {
+        all_states.push_back(request->query_state());
+    }
+    const auto& rank0_states = all_states.front();
+
+    std::vector<ov::SoPtr<ov::IVariableState>> out;
+    out.reserve(rank0_states.size());
+    for (size_t i = 0; i < rank0_states.size(); ++i) {
+        if (!rank0_states[i]) {
+            continue;
+        }
+        const std::string name = rank0_states[i]->get_name();
+        std::vector<ov::SoPtr<ov::IVariableState>> per_rank;
+        per_rank.reserve(num_ranks);
+        for (const auto& states : all_states) {
+            ov::SoPtr<ov::IVariableState> found;
+            for (const auto& s : states) {
+                if (s && s->get_name() == name) {
+                    found = s;
+                    break;
+                }
+            }
+            if (!found && states.size() == rank0_states.size()) {
+                found = states[i];
+            }
+            per_rank.push_back(found);
+        }
+        if (per_rank.empty() || !per_rank.front()) {
+            per_rank.assign(num_ranks, rank0_states[i]);
+        }
+
+        const auto* seam = plan.find_state_seam(name);
+        if (seam != nullptr && seam->kind == TPStateShardKind::HEAD_SHARDED && num_ranks > 1) {
+            out.emplace_back(std::make_shared<TPAggregatedState>(name,
+                                                                 std::move(per_rank),
+                                                                 TPStateShardKind::HEAD_SHARDED,
+                                                                 seam->axis,
+                                                                 seam->full_shape),
+                             nullptr);
+        } else {
+            out.emplace_back(std::make_shared<TPAggregatedState>(name,
+                                                                 std::move(per_rank),
+                                                                 TPStateShardKind::REPLICATED,
+                                                                 -1,
+                                                                 ov::Shape{}),
+                             nullptr);
+        }
+    }
+    return out;
 }
 
 }  // namespace ov::intel_gpu

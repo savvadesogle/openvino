@@ -23,7 +23,7 @@
 - [x] S07 Stage2.2 N-split + all-gather (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S08 Stage2.3 K-split + allreduce (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S09 Stage2.4 int4_ASYM (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S10 Stage3.1 per-rank KV
+- [x] S10 Stage3.1 per-rank KV + state aggregation (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S11 Stage3.2 linear_attention
 - [ ] S12 Stage3.3 Hard (dynamic/events/concurrency)
 - [ ] S13 Stage4.1 GenAI интеграция
@@ -47,6 +47,8 @@
 
 | 2026-10-17 | S09 Stage2.4 int4_ASYM | **частично** (код+тест готовы) | **Распознавание dequant-подграфа**: на момент `TPShardTransform` (до `MarkDequantization`/конвертации FC) int4-проекции — это `MatMul` с dequant-цепочкой на операнде 1: `weight(u4 [..,N,G,gs]) -> Convert(f16) -> Subtract(Convert(zp)) -> Multiply(scale) -> Reshape([..,N,K]) -> Convert(f32)`, поэтому `has_constant_weights` был false и int4-узлы были REPLICA (S06–S08). `match_quantized_weight` распознаёт эту форму (weight/scale/zp/reshape + group_axis/group_size/num_groups). **Срез**: N-split режет weight+scale+zp по N-оси целыми oc-чанками и обновляет target `Reshape` (`n_out→count`), плюс bias-Add-константы; K-split режет weight+scale+zp по group-оси целиком группами (`G % num_ranks == 0`, т.е. K кратно `group_size*num_ranks`) и обновляет `Reshape` (`K→count_g*gs`); активация режется как в S08 (`v8::Slice` по последней оси). **Sub-byte выравнивание**: `slice_is_byte_aligned` (row/off/slab_bits % 8) — правило именно `row_bits`, а не `inner_bits`; невыровненный/неделимый случай → REPLICA (без throw), классификация K_SPLIT сохраняется. zp per-tensor (один элемент) НЕ режется. Реальный Qwen остаётся в основном REPLICA (элементные цепочки достигают следующего GEMM → нужен inter-node all-gather, S10+; o_proj/down_proj residual внутренний → K-split небезопасен, S08-ограничение). Тесты: `Int4NsplitParityMatchesSingleGpu`, `Int4KsplitParityMatchesSingleGpu` (cos>0.999 + проверка `tp_output_seams`), `Int4KsplitIndivisibleFallsBackToReplica` (G=9, без all-reduce). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
 
+| 2026-10-17 | S10 Stage3.1 per-rank KV + state aggregation | **частично** (код+тест готовы) | **Инвентаризация состояний Qwen** (`docs/notes/state-inventory.md`): 64 `ReadValue`/`Assign` (opset6), 0 Stateful; 8 `ScaledDotProductAttention` (full attn) и 24 `Loop`+`ScatterUpdate`+`GroupConvolution` (linear attn). Переменные (f32, dynamic): `past.key.N`/`past.value.N` `?,4,?,256` (KV-head ось = 1, kv-heads=4, head_dim=256), `past.conv.N` `?,8192,4`, `past.ssm.N` `?,32,128,128`. **Ключевой вывод**: реальные Qwen KV/conv/ssm-цепочки не head-local (SDPA/Loop/Concat/GroupConvolution — не element-wise) → head-slice небезопасен, поэтому они остаются **REPLICATED** (rank-0 авторитетный); per-rank KV для Qwen требует inter-node коллективов = S12. **Классификация/шардинг состояний**: `TPShardTransform` после GEMM-прохода собирает переменные (`ReadValueBase`/`AssignBase` по `variable_id`), анализирует `analyze_state_variable`: статическая форма, числовой тип, делимая head-ось (`find_state_head_axis`: предпочтительна ось `rank-2`, иначе первая делимая в `1..rank-2`), цепочка `ReadValue -> (element-wise/broadcast) -> Assign` целиком head-local (все не-цепные операнды broadcast'ятся по head-оси: dim==1 или rank≤axis; init_value ReadValue тоже должен broadcast'иться), иначе `REPLICATED` с диагностической причиной (без throw). При успехе — `var->update_data_shape(sliced)` + `model->validate_nodes_and_infer_types()` (per-pass validation выключен в `transformations_pipeline.cpp:645`). **Структура/транспорт**: `TPStateSeam{variable_id, TPStateShardKind(REPLICATED/HEAD_SHARDED), axis, full_dim, full_shape, reason}` в `TPPlan.state_seams`; rt_info `intel_gpu_tp_state_seams`; RO-property `ov::intel_gpu::tp_state_seams` на `TPCompiledModel` (формат `KIND:AXIS:FULL_DIM:VARIABLE_ID`, напр. `HEAD_SHARDED:1:4:tp_state_var`) и пустое на обычном/плагинном. **Агрегация**: `TPInferRequest::query_state()` строит `TPAggregatedState : ov::IVariableState` по каждому состоянию (совпадение по имени = variable_id): `get_state()` конкатенирует head-оси рангов для HEAD_SHARDED, rank-0 для REPLICATED; `set_state()` скаттерит полный тензор по рангам (`extract_axis_region`) или fan-out; `reset()` — по всем рангам. **Обобщение осей**: `copy_last_axis_region` заменён generic `copy_axis_region`/`extract_axis_region`; `build_output_ports`/`assemble_outputs` собирают all-gather по произвольной оси (для N-split ось по-прежнему последняя); выходы, производные от HEAD_SHARDED-состояния, получают отдельный ALL_GATHER-шов. Тесты: `StateHeadShardingMatchesSingleGpu` (head-local mini-модель, TP2 vs 1-GPU по 5 шагам + проверка шва `HEAD_SHARDED:1:4:` и полной формы агрегированного состояния), `StateNonBroadcastOperandStaysReplicated` (full-width операнд → `REPLICATED:`, паритет), `DefaultCompileHasNoStateSeams`. **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); реальный Qwen state — REPLICATED (обосновано) |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -56,7 +58,7 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
-  Актуально для S05, S06, S07, S08 и S09: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
+  Актуально для S05, S06, S07, S08, S09 и S10: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
   тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
@@ -65,6 +67,22 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S10 done (частично, 2026-10-17)** — Stage 3.1 per-rank KV + state aggregation. Артефакты/решения:
+  - **Реальный Qwen → все состояния REPLICATED.** KV (`ScaledDotProductAttention`), conv (`GroupConvolution`)
+    и ssm (`Loop`) — не element-wise потребители, head-slice небезопасен; per-rank KV для Qwen невозможен
+    без inter-node коллективов (S12). Состояние остаётся полным на каждом ранге, агрегация — rank-0.
+  - **Инвентарь/обоснование** — `docs/notes/state-inventory.md` (новый). Head-ось KV = 1; ssm = ось 1 (32);
+    conv — ось 1 (8192), но linear-attention → S11.
+  - **Формат свойства** `tp_state_seams` = `KIND:AXIS:FULL_DIM:VARIABLE_ID` (тест ищет префикс `HEAD_SHARDED:`
+    и подстроку `:1:4:`). Отличие от исходного дизайна (порядок полей) — см. `tp_state_seam_to_string`.
+  - **Per-pass validation выключен** (`transformations_pipeline.cpp:645`) → после `update_data_shape` обязателен
+    явный `model->validate_nodes_and_infer_types()` (сделано при `state_modified`).
+  - **Форматирование**: репо пинует clang-format-18 (`docs/dev/coding_style.md`), в среде только clang-format 20.1.0 →
+    whole-file прогон даёт массовый нерелевантный churn (макросы/бэкслэши/отступы). **Не запускать clang-format**
+    на этих файлах; стиль — вручную. Все 12 изменённых файлов перезалиты вручную после отклонённого прогона.
+  - **S11 стартует с**: linear-attention состояния (`past.conv.*`, `past.ssm.*`) — тот же пайплайн классификации, но
+    цепочки через `Loop`/`GroupConvolution`/`ScatterUpdate`; ожидаемо снова REPLICATED до S12, если не найдётся
+    head-local подцепочка.
 - **S09 done (частично, 2026-10-17)** — Stage 2.4 int4_ASYM. Артефакты/решения:
   - **Что видит пасс**: `TPShardTransform` вставлен на `transformations_pipeline.cpp:660` — ДО
     `MarkDequantization` (`:701`) и до конвертации `MatMul`→`FullyConnectedCompressed` (`:1758/:1763`).

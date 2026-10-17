@@ -36,15 +36,18 @@
 #include "openvino/core/type/bfloat16.hpp"
 #include "openvino/core/type/float16.hpp"
 #include "openvino/op/add.hpp"
+#include "openvino/op/assign.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/read_value.hpp"
 #include "openvino/op/relu.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/subtract.hpp"
+#include "openvino/op/util/variable.hpp"
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "openvino/runtime/properties.hpp"
@@ -232,6 +235,29 @@ std::shared_ptr<ov::Model> make_int4_ksplit_model(size_t n = 4096, size_t k = 10
 // (K_SPLIT classification preserved, no all-reduce output) and still match single-GPU inference.
 std::shared_ptr<ov::Model> make_int4_ksplit_indivisible_model(size_t n = 4096, size_t k = 1152, size_t gs = 128) {
     return make_int4_ksplit_model(n, k, gs);  // k/gs = 9 groups (odd)
+}
+
+// [S10] Stateful model with a head-shardable recurrent state:
+//   Variable V[1, H, hd] -> ReadValue -> Add(x) -> Assign(V) ; Result(Add)
+// When @p broadcast_input is true, x is [1, 1, hd] so it broadcasts along the head axis and the
+// whole ReadValue -> Add -> Assign chain is head-local: the pass must head-shard V (heads split
+// across ranks, aggregated on query_state()). Otherwise x is full-width [1, H, hd] and the pass
+// must keep V replicated.
+std::shared_ptr<ov::Model> make_stateful_head_model(size_t heads, size_t head_dim, bool broadcast_input) {
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{1, static_cast<int64_t>(heads), static_cast<int64_t>(head_dim)},
+                                   ov::element::f32,
+                                   "tp_state_var"});
+    auto read_value = std::make_shared<ov::op::v6::ReadValue>(variable);
+    const ov::Shape x_shape = broadcast_input ? ov::Shape{1, 1, head_dim} : ov::Shape{1, heads, head_dim};
+    auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, x_shape);
+    auto add = std::make_shared<ov::op::v1::Add>(read_value, x);
+    auto assign = std::make_shared<ov::op::v6::Assign>(add, variable);
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    return std::make_shared<ov::Model>(ov::ResultVector{result},
+                                       ov::SinkVector{assign},
+                                       ov::ParameterVector{x},
+                                       "tp_state_head");
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -835,6 +861,120 @@ TEST_F(TensorParallelCompileGPU, Int4KsplitIndivisibleFallsBackToReplica) {
     ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
     EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999);
     ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S10] GATE: a head-local static state variable must be head-sharded - reported via
+// tp_state_seams, split per rank (each rank keeping H/num_ranks heads) and aggregated back to the
+// full state on query_state(). Multi-step TP inference must match single-GPU over the sequence.
+TEST_F(TensorParallelCompileGPU, StateHeadShardingMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_stateful_head_model(heads, head_dim, /*broadcast_input=*/true);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    // "HEAD_SHARDED:<axis>:<full_dim>:<variable_id>" -> axis 1, full_dim 4.
+    EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+    EXPECT_NE(state_seams[0].find(":1:4:"), std::string::npos) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    const size_t steps = 5;
+    for (size_t t = 0; t < steps; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < head_dim; ++i) {
+            data[i] = 0.25f * static_cast<float>(t + 1) + static_cast<float>(i);
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    // The aggregated TP state must expose the FULL head shape (not the per-rank slice).
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    const ov::Tensor tp_state = tp_states[0].get_state();
+    EXPECT_EQ(tp_state.get_shape(), (ov::Shape{1, heads, head_dim}));
+    auto ref_states = ref_request.query_state();
+    ASSERT_EQ(ref_states.size(), 1u);
+    const ov::Tensor ref_state = ref_states[0].get_state();
+    ASSERT_EQ(ref_state.get_shape(), tp_state.get_shape());
+    ov::test::utils::compare(ref_state, tp_state, 1e-4f, 1e-4f);
+}
+
+// [S10] Negative: a full-width state operand makes the ReadValue chain non-head-local, so the
+// variable must stay REPLICATED (rank 0 authoritative); TP inference must still match single-GPU.
+TEST_F(TensorParallelCompileGPU, StateNonBroadcastOperandStaysReplicated) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_stateful_head_model(heads, head_dim, /*broadcast_input=*/false);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    const size_t steps = 4;
+    for (size_t t = 0; t < steps; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, heads, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < heads * head_dim; ++i) {
+            data[i] = 0.1f * static_cast<float>((i + t) % 7) - 0.3f;
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    // Replicated state is still exposed with the full shape on rank 0.
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    EXPECT_EQ(tp_states[0].get_state().get_shape(), (ov::Shape{1, heads, head_dim}));
+}
+
+// [S10] A plain (single-GPU) compilation must not report any tensor-parallel state seams.
+TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoStateSeams) {
+    ov::Core core;
+    auto plain_model = make_stateful_head_model(4, 2, /*broadcast_input=*/true);
+    auto compiled = core.compile_model(plain_model, ov::test::utils::DEVICE_GPU);
+    auto state_seams = compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    EXPECT_TRUE(state_seams.empty());
 }
 
 }  // namespace

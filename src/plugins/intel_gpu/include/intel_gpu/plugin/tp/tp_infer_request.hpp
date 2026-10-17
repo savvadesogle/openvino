@@ -1,11 +1,13 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05/S07/S08] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S07/S08/S10] Experimental GPU tensor-parallel support.
 // TPInferRequest drives k per-rank inference requests (one per device): inputs are replicated
 // to every rank, only rank-0 outputs are exposed. S07 assembles N-split outputs (all-gather
 // equivalent, concatenation); S08 sums K-split outputs (all-reduce sum) with fp32 accumulation
-// and adds replicated bias/residual terms exactly once.
+// and adds replicated bias/residual terms exactly once. S10 aggregates model state variables
+// across ranks: head-sharded variables are concatenated along their head axis on query_state()
+// (and scattered on set_state()); replicated variables are rank-0 authoritative.
 // See PLAN.md §4.3, §4.4, §7.4.
 
 #pragma once

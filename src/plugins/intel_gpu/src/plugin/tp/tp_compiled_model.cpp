@@ -40,18 +40,18 @@ TPCompiledModel::TPCompiledModel(const std::shared_ptr<const ov::IPlugin>& plugi
 
 // [S07] Ranks only materialize their N-slice of an N-split GEMM, so rank-0's native output
 // shape is the slice shape. For assembly outputs advertise the FULL shape (all-gather
-// equivalent); replicated outputs keep rank-0's native port as-is.
+// equivalent); replicated outputs keep rank-0's native port as-is. S10 generalizes the split
+// axis so head-sharded state outputs (split along an interior axis) also get a full-shape port.
 void TPCompiledModel::build_output_ports() {
     const auto& rank0_outputs = m_ranks.front()->outputs();
     m_outputs.reserve(rank0_outputs.size());
     for (size_t i = 0; i < rank0_outputs.size(); ++i) {
         const auto& port = rank0_outputs[i];
         const auto* seam = m_plan.find_output_seam(i);
-        // Only ALL_GATHER (last-axis N-split) outputs need a synthetic full-shape port: their
-        // rank-0 native shape is the slice. ALL_REDUCE_SUM (K-split) outputs already have the
-        // full shape on every rank, so the native port is exposed as-is.
-        if (seam == nullptr || seam->collective != TPCollectiveKind::ALL_GATHER ||
-            seam->shard_dim_size <= 0 || seam->split_axis > -1) {
+        // Only ALL_GATHER outputs need a synthetic full-shape port: their rank-0 native shape is
+        // the slice. ALL_REDUCE_SUM (K-split) outputs already have the full shape on every rank,
+        // so the native port is exposed as-is.
+        if (seam == nullptr || seam->collective != TPCollectiveKind::ALL_GATHER || seam->shard_dim_size <= 0) {
             m_outputs.push_back(port);
             continue;
         }
@@ -59,7 +59,12 @@ void TPCompiledModel::build_output_ports() {
         auto partial_shape = port.get_partial_shape();
         if (partial_shape.rank().is_static() && partial_shape.rank().get_length() >= 1) {
             const int64_t rank = partial_shape.rank().get_length();
-            const size_t axis = static_cast<size_t>(rank - 1);
+            const int64_t axis_i = seam->split_axis < 0 ? rank + seam->split_axis : seam->split_axis;
+            if (axis_i < 0 || axis_i >= rank) {
+                m_outputs.push_back(port);
+                continue;
+            }
+            const size_t axis = static_cast<size_t>(axis_i);
             if (partial_shape[axis].is_static() && partial_shape[axis].get_length() == seam->shard_dim_size) {
                 // Already the full shape (e.g. graceful REPLICA fallback) - keep native port.
                 m_outputs.push_back(port);
@@ -117,6 +122,7 @@ ov::Any TPCompiledModel::get_property(const std::string& name) const {
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_seams.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_output_seams.name(), PropertyMutability::RO});
+        props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_state_seams.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::hint::model_distribution_policy.name(), PropertyMutability::RO});
         return props;
     }
@@ -138,6 +144,14 @@ ov::Any TPCompiledModel::get_property(const std::string& name) const {
             seams.push_back(tp_output_seam_to_string(seam));
         }
         return decltype(ov::intel_gpu::tp_output_seams)::value_type{std::move(seams)};
+    }
+    if (name == ov::intel_gpu::tp_state_seams) {
+        std::vector<std::string> seams;
+        seams.reserve(m_plan.state_seams.size());
+        for (const auto& seam : m_plan.state_seams) {
+            seams.push_back(tp_state_seam_to_string(seam));
+        }
+        return decltype(ov::intel_gpu::tp_state_seams)::value_type{std::move(seams)};
     }
     if (name == ov::hint::model_distribution_policy) {
         return decltype(ov::hint::model_distribution_policy)::value_type{ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};

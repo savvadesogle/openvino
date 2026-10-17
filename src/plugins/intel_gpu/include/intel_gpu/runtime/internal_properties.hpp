@@ -51,6 +51,18 @@ static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_s
 static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_output_seams{"TP_OUTPUT_SEAMS"};
 
 /**
+ * @brief Read-only property reporting how model state variables (ReadValue/Assign) are distributed
+ * across tensor-parallel ranks. Each entry is encoded as
+ * "<kind>:<axis>:<full_dim>:<variable_id>" (see ov::intel_gpu::tp_state_seam_to_string), where
+ * HEAD_SHARDED means the state is split along the head axis (aggregated by TPInferRequest by
+ * concatenation) and REPLICATED means it is identical on every rank (rank 0 authoritative).
+ * Empty for non-TP compilation. Missing variables are implicitly replicated.
+ *
+ * [TP-GPU, S10] Experimental GPU tensor-parallel support. See PLAN.md §4.3, §5 (S10).
+ */
+static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_state_seams{"TP_STATE_SEAMS"};
+
+/**
  * @brief Internal/test flag that enables tensor-parallel compilation of a model.
  * Equivalent to requesting ov::hint::model_distribution_policy{TENSOR_PARALLEL}. It is mainly
  * intended for functional tests (mirrors ov::intel_cpu::enable_tensor_parallel).

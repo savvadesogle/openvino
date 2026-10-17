@@ -99,6 +99,7 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_tensor_parallel(const 
         if (!seams_collected && rc.rank == 0) {
             plan.seams = get_tp_seams(transformed_model);
             plan.output_seams = get_tp_output_seams(transformed_model);
+            plan.state_seams = get_tp_state_seams(transformed_model);
             seams_collected = true;
         }
         rc.config.finalize(rc.context.get(), transformed_model.get());
