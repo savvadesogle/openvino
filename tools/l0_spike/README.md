@@ -1,22 +1,29 @@
-# tools/l0_spike — S02 Level Zero capability spike
+# tools/l0_spike — Level Zero capability + microbench spikes (S02/S03)
 
-Read-only probe of inter-device Level Zero capabilities on **Windows**, used as
-input for the TP collectives design (PLAN.md §4.4). It does **not** measure
-performance (that is S03) and does **not** touch `src/**`.
+Read-only probes of inter-device Level Zero capabilities and data-transfer paths
+on **Windows**, used as input for the TP collectives design (PLAN.md §4.4). They
+do **not** touch `src/**` and require no build step (Python 3 + `ctypes` over the
+system `ze_loader.dll`).
 
 ## Files
 
-- `l0_capability.py` — the probe. Python 3 + `ctypes` over the system
-  `ze_loader.dll` (no build step). Enumerates L0 GPU drivers/devices, prints the
-  `zeDeviceCanAccessPeer` N×N matrix, P2P properties, and probes IPC memory and
-  (counter-based) IPC events.
-- `l0_capability_output.txt` — captured run on this machine (2× Arc A770),
-  referenced by `docs/notes/l0-spike.md`.
+- `l0_capability.py` (S02) — capability probe: enumerates L0 GPU drivers/devices,
+  prints the `zeDeviceCanAccessPeer` N×N matrix, P2P properties, and probes IPC
+  memory and (counter-based) IPC events. Measures nothing.
+- `l0_bench.py` (S03) — microbenchmark of the **available** inter-device paths
+  (same-device baseline, host-USM staging device→host→device, shared USM). Sizes
+  4 KB–128 MB, both directions, median/min/percentiles, effective GB/s + host-
+  observed latency. Reuses types/loader helpers from `l0_capability.py`. Copies
+  use regular command lists + in-order queues + `zeCommandQueueSynchronize`
+  (no `zeEvent*`, which crashed the driver in S02).
+- `l0_capability_output.txt`, `l0_bench_output.txt` — captured runs on this
+  machine (2× Arc A770), referenced by `docs/notes/l0-spike.md`.
 
 ## Usage
 
 ```powershell
 python l0_capability.py
+python l0_bench.py
 ```
 
 ## Notes

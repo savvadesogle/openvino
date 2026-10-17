@@ -150,3 +150,104 @@ Driver IPC properties: `flags = 0x3` → `ZE_IPC_PROPERTY_FLAG_MEMORY` **и**
 (обычными `zeEvent*`, а не counter-based IPC), и (б) любые доступные
 device-to-device пути, даже если они идут через host. Гипотезу о дефолте
 подтвердить числами в S03.
+
+---
+
+# L0 microbench — результаты S03 (Windows)
+
+Канон: PLAN.md §4.4, §5 (S03). Чеклист: `docs/notes/l0-spike-plan.md` §2.
+Метод: тот же read-only спайк через Python `ctypes` поверх `ze_loader.dll`.
+Инструмент: `tools/l0_spike/l0_bench.py` (переиспользует типы/loader-helpers из
+`l0_capability.py`); сырой вывод — `tools/l0_spike/l0_bench_output.txt`.
+Окружение идентично S02 (§0 выше): 2× Arc A770, Win 11 22631, драйвер
+32.0.101.9150, L0 loader 1.33.1, apiVersion 1.17. Дата прогона: 2026-10-17.
+
+## 8.1 Метод и командный path
+
+- Копии: `zeCommandListAppendMemoryCopy` на **обычном (не immediate) command
+  list** + in-order `zeCommandQueue`, синхронизация `zeCommandQueueSynchronize
+  (UINT64_MAX)` (host-blocking). События `zeEvent*` **сознательно не
+  использованы**: в S02 classic `zeEventCreate` из ctypes крашил драйвер
+  (STATE.md). Path зафиксирован как «regular command list + in-order queue +
+  queue synchronize».
+- Размеры: 4 KB, 64 KB, 1 MB, 16 MB, 128 MB; обе стороны.
+- На размер: bandwidth ≈ median per-op при batch (128/128/32/2/1 копий на один
+  sync; batch амортизирует overhead сабмита), latency — median одиночной копии
+  (host-observed, включает сабмит+sync). Warmup 3, reps 20 (≤1 MB) / 8 (>1 MB).
+- Аллокации: на каждый GPU по 2 device-USM буфера (src/dst, 128 MB каждый);
+  pinned host USM (`zeMemAllocHost`, ctx0) 128 MB; shared USM
+  (`zeMemAllocShared`, ctx0/dev0) 128 MB.
+- Корректность: h2d→d2h roundtrip 4 KB на каждом GPU → **MATCH** (данные
+  реально ходят), см. вывод.
+
+## 8.2 Какие пути есть, а какие NA
+
+| путь | статус на этой машине | примечание |
+|---|---|---|
+| peer i→j напрямую (device USM) | **NA** | `zeDeviceCanAccessPeer=false` (S02 §3); cross P2P flags = 0x0 |
+| IPC memory / IPC events | **NA** | S02 §4–6: `UNSUPPORTED_FEATURE` / `OUT_OF_DEVICE_MEMORY` |
+| shared USM кросс-девайс (dev1↔shared dev0) | **NA (код ошибки)** | `zeCommandListAppendMemoryCopy` → `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` |
+| **host-USM staging** (dev_i → pinned host → dev_j) | **есть** | единственный рабочий междевайсный путь; роут помечен явно |
+| same-device dev→dev | есть | baseline локальной полосы |
+| shared USM same-device | есть | только в пределах устройства-владельца |
+
+## 8.3 Эффективный bandwidth, GB/s (median per-op)
+
+| путь (route) | 4 KB | 64 KB | 1 MB | 16 MB | 128 MB |
+|---|---|---|---|---|---|
+| same-dev GPU0→GPU0 (device USM) | 2.86 | 70.70 | 321.25 | 145.57 | 190.95 |
+| same-dev GPU1→GPU1 (device USM) | 2.92 | 77.60 | 336.55 | 152.49 | 191.74 |
+| dev0→pinned host (d2h) | 2.86 | 66.13 | 148.50 | 10.21 | 10.47 |
+| dev1→pinned host (d2h) | 2.99 | 71.97 | 155.81 | 7.40 | 7.28 |
+| pinned host→dev0 (h2d) | 2.85 | 67.22 | 143.86 | 9.56 | 9.84 |
+| pinned host→dev1 (h2d) | 2.92 | 71.70 | 148.90 | 9.59 | 9.32 |
+| **staging 0→host→1** (кросс) | 0.25 | 6.16 | 44.69 | 4.78 | 4.90 |
+| **staging 1→host→0** (кросс) | 0.37 | 6.18 | 44.88 | 4.03 | 4.16 |
+| shared-wr dev0→shared | 4.51 | 72.41 | 292.92 | 146.24 | 191.53 |
+| shared-rd shared→dev0 | 4.56 | 71.42 | 319.11 | 147.33 | 191.07 |
+| shared-wr dev1→shared (кросс) | NA | NA | NA | NA | NA (OUT_OF_DEVICE_MEMORY) |
+| shared-rd shared→dev1 (кросс) | NA | NA | NA | NA | NA (OUT_OF_DEVICE_MEMORY) |
+
+Наблюдения:
+- **≤1 MB узлы «кэш-шумят»**: те же буферы переиспользуются, 1 MB укладывается
+  в кэш → 150–330 GB/s не отражают PCIe. **Реалистична полоса на 16/128 MB.**
+- **Реальный междевайсный канал = PCIe через host**: одна сторона d2h/h2d
+  ~7–10 GB/s (16–128 MB), staging end-to-end ~4–5 GB/s (сумма двух
+  последовательных плеч).
+- Локальная (same-device) полоса 145–192 GB/s на 16/128 MB — верхняя граница
+  того, что мог бы дать peer, будь он доступен (≈20–40× быстрее staging).
+- **shared USM не работает кросс-девайс** (dev1 не видит аллокацию ctx0/dev0:
+  `OUT_OF_DEVICE_MEMORY`) — как и ожидалось при отсутствии peer-доступа. Значит
+  `zeMemAllocShared` не является междевайсным путём на этой конфигурации.
+- h2d на dev1 из host-USM, аллоцированного в ctx0, **работает** (host USM
+  доступен обеим картам) — staging корректен.
+
+## 8.4 Latency одиночной копии (host-observed, median µs)
+
+| путь | 4 KB | 64 KB | 1 MB |
+|---|---|---|---|
+| same-dev GPU0→GPU0 | 89.1 | 80.9 | 84.9 |
+| same-dev GPU1→GPU1 | 81.5 | 59.6 | 79.0 |
+| dev0→host | 89.2 | 87.2 | 181.6 |
+| host→dev0 | 89.7 | 88.3 | 190.8 |
+| host→dev1 | 80.2 | 66.3 | 174.8 |
+
+- На 4 KB / 64 KB latency ≈ **60–90 µs** для всех путей — это **floor
+  host-сабмита+sync**, а не время передачи (данные физически копируются
+  ~1.4 µs). Т.е. host-синхронный коллективный шов стоит десятки µs на вызов.
+- Staging latency одиночки не мерилась (2 стадии + 2 sync), но по throughput
+  видно, что на 128 MB staging = 27–32 ms на сообщение.
+- Для «швов» TP это аргумент за **device-side синхронизацию** (события/барьеры
+  между enqueue и wait, без host-polling на слой) — вынести в S12/S08. Здесь
+  counter-based events device-side (S02), IPC-события — NA.
+
+## 8.5 Вывод для G0 (решение — в STATE.md, журнал гейтов)
+
+Единственный рабочий междевайсный путь на целевой машине — **host-USM staging**
+(`zeMemAllocHost` pinned + per-device command queue, локальная копия через
+`zeCommandListAppendMemoryCopy`). Полоса: ~7–10 GB/s на плечо, **~4–5 GB/s
+end-to-end** на 16–128 MB; на малых размерах доминирует host-сабмит/sync
+(~80 µs/вызов). Peer-path и IPC недоступны (S02), shared-USM кросс-девайс тоже
+недоступен (S03). ⇒ **G0: дефолт коллективов TP = host-USM staging**;
+peer-путь проектируется как runtime-detect fast-path (`zeDeviceCanAccessPeer`),
+но на этой конфигурации он неактивен.

@@ -1,84 +1,95 @@
-# СЕССИЯ S03 — L0-спайк B: микробенч путей междевайсной передачи + решение G0 · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
+# СЕССИЯ S04 — Stage 1.1 TPCoordinator: k engines, TP-ветка compile, props · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
 
 ## Как работать
 - Сначала полностью прочитай:
-  1) C:\openvino-tp\PLAN.md — канон (НЕ редактировать в сессии)
-  2) C:\openvino-tp\STATE.md — живое состояние (особенно «Заметки сессия → следующая»)
-  3) C:\openvino-tp\docs\notes\l0-spike-plan.md — чеклист §2 (задача этой сессии)
-  4) C:\openvino-tp\docs\notes\l0-spike.md — результаты S02 (capability-матрица; вход в S03)
-  5) при необходимости: gpu-plugin-arch.md §5 (что уже есть в дереве по L0/IPC)
-- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S03 (таблица в PLAN.md §5).
-  Следующие этапы запрещены, даже если остаётся время/контекст. Остановка на GATE или
-  блокере — нормальный результат; зафиксируй его в STATE.md.
+  1) C:\openvino-tp\PLAN.md — канон (НЕ редактировать в сессии), особенно §3 (ключевые
+     факты кода), §4.1–4.2 (дизайн API/compile), §5 (строка S04), §7 (риски).
+  2) C:\openvino-tp\STATE.md — живое состояние (особенно «Заметки сессия → следующая»;
+     поле «Коллективы дефолт» и «Находки S03»).
+  3) C:\openvino-tp\docs\notes\gpu-plugin-arch.md — конспект архитектуры GPU-плагина
+     (точки касания: `plugin/plugin.cpp`, `remote_context.cpp`, `compiled_model.cpp`,
+     `transformations_pipeline.cpp`).
+  4) C:\openvino-tp\docs\notes\l0-spike.md — результаты L0-спайков S02/S03 (для контекста
+     коллективов; в S04 коллективы ещё НЕ реализуются).
+- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S04 (таблица PLAN.md §5).
+  Следующие этапы (S05+) запрещены, даже если остаётся время/контекст. Остановка на GATE
+  или блокере — нормальный результат; зафиксируй его в STATE.md.
 
 ## Контекст, который УЖЕ исполнен (не повторять)
-- S01 done: ветка feature/gpu-tensor-parallel; 4 конспекта в docs/notes/.
-- S02 done (2026-10-17): `tools/l0_spike/l0_capability.py` (+ README, + captured output);
-  результаты в `docs/notes/l0-spike.md`. ГЛАВНЫЕ ФАКТЫ S02 (не переоткрывать):
-  * Железо: 2× Intel Arc A770 (DG2, deviceId 0x56A0), Windows 11 build 22631,
-    драйвер 32.0.101.9150, L0 loader 1.33.1, apiVersion 1.17.
-  * `zeDeviceCanAccessPeer` кросс-девайс = **false**; P2P flags кросс = 0x0.
-    ⇒ peer-copy как таковой **не на чем мерять**.
-  * IPC-память на Windows **недоступна**: core `zeMemGetIpcHandle` и
-    `ZEX_mem_ipc_handles` → `ZE_RESULT_ERROR_UNSUPPORTED_FEATURE`.
-  * Counter-based IPC-события: `Create2` ok, но `GetIpcHandle` →
-    `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY`. Символы `zex*` — только через
-    `zeDriverGetExtensionFunctionAddress`.
-  * Counter-based event — device-side: `zeEventHostSignal` → UNSUPPORTED_FEATURE,
-    host-query всегда SUCCESS. Обычный `zeEventCreate` из ctypes **крашил** драйвер.
-- Тест-модель в этой сессии НЕ нужна.
+- S01 done: ветка feature/gpu-tensor-parallel; 4 конспекта в `docs/notes/`
+  (cpu-tp-pattern, gpu-plugin-arch, hetero-pp, l0-spike-plan).
+- S02 done (2026-10-17): capability-спайк L0 (`tools/l0_spike/l0_capability.py`),
+  результаты — `docs/notes/l0-spike.md` §1–7. Главное: 2× Arc A770 (DG2, 0x56A0),
+  Windows 11 22631, драйвер 32.0.101.9150, L0 loader 1.33.1, apiVersion 1.17;
+  `zeDeviceCanAccessPeer` кросс = false; IPC памяти/событий нет.
+- S03 done (2026-10-17): микробенч (`tools/l0_spike/l0_bench.py`), результаты —
+  `docs/notes/l0-spike.md` §8. **Gate G0 РЕШЁН: дефолт коллективов = host-USM
+  staging** (единственный рабочий междевайсный путь: dev→pinned host→dev, ~7–10 GB/s
+  на плечо, ~4–5 GB/s end-to-end на 16–128 MB; peer/IPC/кросс-shared USM — NA).
+  В S04 транспорт коллективов ещё НЕ строится.
+- Тест-модель: `models/Qwen3.5-9B-int4-ov/` — в S04 НЕ нужна (GATE на мини-сети с FC).
 
-## Задача S03 (полный объём этой сессии)
-Микробенч междевайсной передачи данных на 2×A770 (Windows L0) и **решение Gate G0**
-(дефолтный путь коллективов TP). Всё read-only относительно OpenVINO; инструмент — в
-`tools/l0_spike/` (новые файлы вне `src/**`).
+## Задача S04 (полный объём этой сессии)
+Stage 1.1 — **TPCoordinator**: перечисление GPU, k per-rank engines/контекстов, TP-ветка
+в `Plugin::compile_model`, свойства. Цель GATE — **TP-компиляция 2-GPU мини-сети** (модель
+с одним/несколькими FullyConnected), т.е. `core.compile_model(mini_model, "GPU",
+{model_distribution_policy: TENSOR_PARALLEL})` отрабатывает и создаёт k рангов;
+корректность исполнения (паритет) — ещё НЕ требуется (S05).
 
-1. Расширить `tools/l0_spike/` (переиспользовать `l0_capability.py`: res/alloc/copy
-   helpers; новый, напр. `l0_bench.py`). Никаких изменений `src/**`, сборки OpenVINO.
-2. Поскольку S02 показал отсутствие peer и IPC на этой машине, бенч строить вокруг
-   реально доступных путей и **явно** это фиксировать (это ожидаемый, а не ошибочный ход):
-   - (A) **host-USM staging**: device i → pinned host USM (`zeMemAllocHost`) → device j.
-     Отдельно мерить device→host и host→device; считать end-to-end.
-     Использовать `zeCommandListAppendMemoryCopy` на immediate-списках per-device
-     (создать command list/queue на каждом GPU) **и/или** `zeMemAllocShared`;
-   - (B) **shared USM** (если поддерживается): аллокация `zeMemAllocShared` и
-     доступ с оба device — проверить/померить (может тоже упираться в отсутствие
-     peer access — тогда зафиксировать);
-   - (C) **same-device copy** (device→device в пределах одного GPU) как baseline
-     локальной полосы;
-   - (D) если удастся получить любой кросс-девайсный путь (даже через host) —
-     обязательно пометить, через что он идёт.
-   - Peer-copy (i→j напрямую) — записать как **NA** со ссылкой на S02
-     (`canAccessPeer=false`); не выдумывать.
-3. Размеры: 4 KB, 64 KB, 1 MB, 16 MB, 128 MB; обе стороны (0→1 и 1→0).
-   Warmup + N итераций; фиксировать медиану/перцентили; эффективный bandwidth
-   (GB/s) и latency (µs) на малых размерах. Указать использованный path
-   (immediate list / copy engine / host memcpy).
-4. Latency синхронизации (по возможности): событие/барьер между enqueue и wait;
-   host-polling vs device-side. Counter-based events — только device-side (S02);
-   для host-синхронизации осторожно с `zeEvent*` (краш в S02 — см. STATE).
-5. Deliverable:
-   - таблицы результатов в `docs/notes/l0-spike.md` (дописать раздел S03; шапку с
-     avg-числами и path'ами);
-   - **решение Gate G0** — дефолт коллективов (host-USM staging vs иное) — в STATE.md
-     (журнал гейтов, строка «S03 … G0») + краткая сводка в `l0-spike.md`;
-   - обновить поле STATE «Коллективы дефолт».
-6. NEXT.md — перезаписать ПОЛНЫМ промптом S04 (Stage 1.1 TPCoordinator: k engines,
-   TP-ветка compile, props; чеклист — PLAN §4.1–4.2, S04 в таблице §5).
-7. Commit (сообщение: "S03: L0 microbench + G0") — **локально, без push**.
+Работать в `src/plugins/intel_gpu/**` (это уже НЕ read-only: S04 — первый этап с кодом).
+Не запускать сборку, если она недоступна/слишком тяжёлая — тогда зафиксировать в STATE,
+что собрать не удалось, и оставить код+тест-план; GATE считать частично пройденным с явной
+пометкой. Если есть среда сборки — минимально проверить компиляцию целевых файлов.
 
-## GATE S03 (критерии завершения)
-- bw/latency-таблицы для доступных путей записаны в `docs/notes/l0-spike.md`.
-- Решение **G0** (дефолт коллективов) зафиксировано в STATE.md (журнал гейтов) и
-  отражено в поле «Коллективы дефолт».
-- STATE.md: S03 done. NEXT.md: готовый полный промпт S04.
-- Финальный ответ сессии: кратко что сделано, что показал GATE, и текст нового NEXT.md.
+1. **Свойства/API** (PLAN §4.1):
+   - Точки: `Plugin::compile_model` (`plugin/plugin.cpp:267-306`), `PluginConfig`/
+     `ExecutionConfig`, перечисление устройств `m_device_map` (`plugin/plugin.cpp:227-258`).
+   - Публичный API уже есть: `src/inference/include/openvino/runtime/properties.hpp:436-488`
+     (`ModelDistributionPolicy::{TENSOR_PARALLEL|PIPELINE_PARALLEL}`). В intel_gpu сейчас
+     нет ни одного упоминания — добавить чтение `ov::hint::model_distribution_policy`.
+   - Ввести внутренний `ov::intel_gpu::enable_tensor_parallel` и read-only
+     `ov::intel_gpu::tp_ranks` (по образцу CPU — см. `docs/notes/cpu-tp-pattern.md`).
+     `get_property` должен отдавать TP-отчёт. Понятные ошибки для несовместимых
+     комбинаций («GPU.0» + TP, TP на 1 GPU, PP на GPU).
+2. **TPCoordinator** (PLAN §4.2, §4.4):
+   - Перечислить GPU (`m_device_map`), выбрать k (MVP: TP=2), создать k per-rank
+     `RemoteContextImpl`/engine (это НЕ один `CompiledModel` на несколько device:
+     `remote_context.cpp:59` явно требует `devices.size()==1` — k независимых контекстов).
+   - Клонировать модель на ранг; вызвать существующий путь компиляции per-rank.
+     Пасс `TPShardTransform` в этом этапе — ЗАГЛУШКА/нет (шардирование — S06+); важно
+     получить k графов.
+   - Место для TP-пассов — рядом с плагинными пассами в `transformations_pipeline.cpp`
+     (см. `gpu-plugin-arch.md` §3), до фьюжнов; в S04 достаточно точки расширения.
+   - Собрать минимальный `TPPlan` (заготовка структуры: ранги, классификация швов пустая) —
+     без коллективов.
+3. **Обёртка** (заготовка, полное исполнение — S05):
+   - `TPCompiledModel`/`TPInferRequest` — каркас (k графов, входы/выходы ранга 0), но
+     корректный e2e-инференс не входит в GATE S04. Достаточно, чтобы compile вернул
+     объект, способный сообщить `tp_ranks`.
+4. **Тест/GATE**: мини-сеть с FullyConnected (ручная `ov::Model`: Parameter → MatMul/FC →
+   Result), 2 GPU, `model_distribution_policy=TENSOR_PARALLEL` → компиляция проходит,
+   `tp_ranks==[0,1]` (или корректный отчёт). Отрицательные кейсы: TP на 1 GPU,
+   `"GPU.0"`+TP, `PIPELINE_PARALLEL` на GPU → внятная ошибка.
+   Тест положить туда, где живут GPU-тесты (проверить дерево `src/plugins/intel_gpu/tests/**`
+   и соглашения; не ломать существующие).
+
+## GATE S04 (критерии завершения)
+- TP-ветка `compile_model` компилирует 2-GPU мини-сеть; `TPCoordinator` создаёт k рангов.
+- Свойства добавлены и читаются (`model_distribution_policy`, `enable_tensor_parallel`,
+  `tp_ranks`); ошибки несовместимых комбинаций внятные.
+- STATE.md: S04 done (или честный блокер, если сборка/тест невозможны в среде) +
+  артефакты + решения + заметки → S05.
+- NEXT.md — полный самодостаточный промпт S05 (Stage 1.2 TPInferRequest: реплика цельного
+  графа на 2 GPU, выходы rank0; GATE — e2e паритет vs 1-GPU).
+- Commit (сообщение: "S04: TPCoordinator (k engines, TP compile, props)") — **локально,
+  без push**.
 
 ## Жёсткие ограничения
-- **Только локально: remote (origin/upstream) НЕ трогаем — никаких push/pull/изменений
-  удалённого репозитория.**
-- НЕ изменять `src/**`; не запускать сборки/компиляции OpenVINO.
-- Спайк остаётся в `tools/l0_spike/`; не коммитить .bin/модельные файлы; секреты не
-  писать в файлы/логи/историю.
-- Попутные находки — в STATE «Заметки сессия → следующая» или docs/notes/;
-  реализовывать не по плану ничего нельзя (атомарность этапа).
+- **Только локально: remote (origin/upstream) НЕ трогаем** — никаких push/pull/изменений
+  удалённого репозитория (см. STATE «Remote-политика»).
+- Атомарность этапа: не реализовывать S05+ (реальный inference, шардирование, коллективы).
+- Не коммитить .bin/модельные файлы; секреты не писать в файлы/логи/историю.
+- `PLAN.md` в сессии не редактировать; дельты — в STATE.md.
+- Попутные находки — в STATE «Заметки сессия → следующая» или docs/notes/.
+- Если нужна сборка OpenVINO и она недоступна — не изобретать обходные сборки; зафиксировать
+  блокер в STATE и считать GATE частичным (код + план теста готовы).
