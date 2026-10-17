@@ -1,16 +1,19 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04] GATE test for the GPU tensor-parallel compile path (Stage 1.1).
-// Milestone S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over
-// a 2-GPU mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
-// ov::intel_gpu::tp_ranks. Execution parity is NOT checked here (S05).
-// See PLAN.md §4.1, §4.2, §5 (S04).
+// [TP-GPU, S04/S05] GATE tests for the GPU tensor-parallel compile + infer path.
+// S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
+//      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
+//      ov::intel_gpu::tp_ranks.
+// S05: TPInferRequest executes the replicated graph on both ranks and exposes rank-0 outputs;
+//      the result must match a single-GPU reference inference (e2e parity).
+// See PLAN.md §4.1, §4.2, §4.4, §5 (S04, S05).
 
 #include <set>
 #include <string>
 #include <vector>
 
+#include "common_test_utils/ov_tensor_utils.hpp"
 #include "openvino/core/model.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
@@ -19,6 +22,7 @@
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "openvino/runtime/properties.hpp"
+#include "openvino/runtime/tensor.hpp"
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "shared_test_classes/base/ov_behavior_test_utils.hpp"
 
@@ -31,6 +35,21 @@ std::shared_ptr<ov::Model> make_fc_mini_model() {
     auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
     auto result = std::make_shared<ov::op::v0::Result>(matmul);
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_fc_mini");
+}
+
+// Same topology but with distinctive, non-uniform weights: parity mismatches caused by a rank
+// not receiving the input (or the wrong rank's output being read) turn into large numeric deltas.
+std::shared_ptr<ov::Model> make_tp_parity_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8});
+    std::vector<float> weights_data(8 * 16);
+    for (size_t i = 0; i < weights_data.size(); ++i) {
+        const float mag = 0.05f * static_cast<float>((i % 7) + 1);
+        weights_data[i] = (i % 2 == 0) ? mag : -mag;
+    }
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8, 16}, weights_data);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
+    auto result = std::make_shared<ov::op::v0::Result>(matmul);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_parity");
 }
 
 // Number of individually addressable GPU devices (excludes sub-devices such as "GPU.0.0").
@@ -121,6 +140,44 @@ TEST_F(TensorParallelCompileGPU, RejectsPipelineParallel) {
     ov::AnyMap props = {ov::hint::model_distribution_policy(pp_policy)};
 
     EXPECT_THROW(core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props), ov::Exception);
+}
+
+// [S05] GATE: tensor-parallel inference (2 GPUs) must match single-GPU inference on the same
+// replicated mini model. Ranks are identical at this stage, so no sharding arithmetic is involved.
+TEST_F(TensorParallelCompileGPU, TensorParallelInferMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_tp_parity_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) - 3.5f;
+        }
+    }
+
+    // Reference: plain single-GPU inference.
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(input);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    // Tensor parallel: replicated graph on both GPUs, outputs from rank 0.
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(input);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
 }
 
 }  // namespace

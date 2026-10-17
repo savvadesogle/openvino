@@ -1,11 +1,11 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05] Experimental GPU tensor-parallel support.
 // TPCompiledModel wraps k per-rank CompiledModel instances (one per device) and a TPPlan.
-// In S04 it is a skeleton: it only reports the tensor-parallel rank table (ov::intel_gpu::tp_ranks)
-// and delegates inference to the rank-0 compiled model. Correct k-rank execution
-// (input replication, rank-0 outputs, device-side seams) is implemented in S05+.
+// It reports the tensor-parallel rank table (ov::intel_gpu::tp_ranks) and creates a
+// TPInferRequest that executes the replicated graph on all k ranks (rank-0 outputs).
+// Sharding and device-side seams are implemented in S06+.
 // See PLAN.md §4.4.
 
 #pragma once
@@ -20,11 +20,14 @@
 
 namespace ov::intel_gpu {
 
+class TPInferRequest;
+
 /**
  * @brief Compiled model spanning several GPUs with a tensor-parallel distribution.
  *
  * Owns k independent per-rank CompiledModel objects (each bound to its own device/engine).
- * S04 scope: compile-time skeleton + tp_ranks report. Inference currently delegates to rank 0.
+ * S05 scope: create_infer_request()/create_sync_infer_request() return TPInferRequest,
+ * which runs the replicated graph on every rank and exposes rank-0 outputs.
  */
 class TPCompiledModel : public ov::ICompiledModel {
 public:

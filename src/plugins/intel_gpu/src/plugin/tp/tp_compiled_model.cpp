@@ -1,15 +1,18 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05] Experimental GPU tensor-parallel support.
 // See PLAN.md §4.1, §4.4.
 
 #include "intel_gpu/plugin/tp/tp_compiled_model.hpp"
 
+#include "intel_gpu/plugin/tp/tp_infer_request.hpp"
 #include "intel_gpu/runtime/itt.hpp"
 #include "openvino/core/except.hpp"
+#include "openvino/runtime/iasync_infer_request.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "openvino/runtime/properties.hpp"
+#include "openvino/runtime/threading/cpu_streams_executor.hpp"
 
 namespace ov::intel_gpu {
 
@@ -22,6 +25,12 @@ TPCompiledModel::TPCompiledModel(const std::shared_ptr<const ov::IPlugin>& plugi
     OPENVINO_ASSERT(!m_ranks.empty(), "[GPU][TP] Tensor-parallel compiled model requires at least one rank");
     OPENVINO_ASSERT(m_ranks.size() == m_plan.ranks.size(),
                     "[GPU][TP] Rank models count (", m_ranks.size(), ") doesn't match plan ranks (", m_plan.ranks.size(), ")");
+
+    // The base ICompiledModel was created without executors (each rank carries its own), but
+    // the async wrapper needs a task executor to run the whole k-rank execution off the caller
+    // thread. Build a dedicated executor so TP requests stay isolated from rank streams.
+    set_task_executor(std::make_shared<ov::threading::CPUStreamsExecutor>(
+        ov::threading::IStreamsExecutor::Config{"Intel GPU TP plugin executor"}));
 }
 
 const std::vector<ov::Output<const ov::Node>>& TPCompiledModel::outputs() const {
@@ -32,16 +41,17 @@ const std::vector<ov::Output<const ov::Node>>& TPCompiledModel::inputs() const {
     return m_ranks.front()->inputs();
 }
 
-// S04 skeleton: correct k-rank execution (input replication, rank-0 outputs, device-side seams)
-// is implemented in S05. Until then inference is delegated to the rank-0 composed model.
+// S05: all k ranks execute the replicated graph; inputs are replicated to every rank,
+// outputs are taken from rank 0 (see TPInferRequest).
 std::shared_ptr<ov::IAsyncInferRequest> TPCompiledModel::create_infer_request() const {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "TPCompiledModel::create_infer_request");
-    return m_ranks.front()->create_infer_request();
+    // The default ov::IAsyncInferRequest runs TPInferRequest::infer() as a single task.
+    return create_async_infer_request<>();
 }
 
 std::shared_ptr<ov::ISyncInferRequest> TPCompiledModel::create_sync_infer_request() const {
     OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "TPCompiledModel::create_sync_infer_request");
-    return m_ranks.front()->create_sync_infer_request();
+    return std::make_shared<TPInferRequest>(std::static_pointer_cast<const TPCompiledModel>(shared_from_this()));
 }
 
 void TPCompiledModel::export_model(std::ostream&) const {

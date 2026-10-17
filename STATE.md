@@ -18,7 +18,7 @@
 - [x] S02 L0-спайк A (2026-10-17): tools/l0_spike/{l0_capability.py,README.md,l0_capability_output.txt}; результаты — docs/notes/l0-spike.md; capability-матрица зафиксирована (GATE пройден)
 - [x] S03 L0-спайк B (G0) (2026-10-17): tools/l0_spike/l0_bench.py (+ output); bw/latency-таблицы — docs/notes/l0-spike.md §8; **G0 = host-USM staging** (журнал гейтов)
 - [x] S04 Stage1.1 TPCoordinator (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S05 Stage1.2 TPInferRequest
+- [x] S05 Stage1.2 TPInferRequest (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S06 Stage2.1 TPShardTransform-скелет
 - [ ] S07 Stage2.2 N-split + all-gather
 - [ ] S08 Stage2.3 K-split + allreduce
@@ -38,6 +38,7 @@
 | 2026-10-17 | S02 L0-спайк A | done | capability-матрица известна и записана в docs/notes/l0-spike.md: 2×A770; canAccessPeer кросс = false; P2P кросс = 0x0; IPC-память UNSUPPORTED_FEATURE (core и ZEX_mem_ipc_handles); counter-based IPC event GetIpcHandle = OUT_OF_DEVICE_MEMORY. Решение G0 — в S03 (перф не мерялась) |
 | 2026-10-17 | **S03 L0-спайк B → G0** | **G0 = host-USM staging** | Микробенч (docs/notes/l0-spike.md §8): единственный рабочий междевайсный путь — dev_i→pinned host→dev_j; ~7–10 GB/s/плечо, ~4–5 GB/s end-to-end (16–128 MB); локальная same-device полоса 145–192 GB/s; кросс-shared USM = OUT_OF_DEVICE_MEMORY; peer/IPC NA (S02). Дефолт коллективов TP — host-USM staging; peer — runtime fast-path по `zeDeviceCanAccessPeer` |
 | 2026-10-17 | S04 Stage1.1 TPCoordinator | **частично** (код+тест готовы) | TP-ветка `compile_model`, `TPCoordinator`, `TPCompiledModel`, свойства (`model_distribution_policy`/`enable_tensor_parallel`/`tp_ranks`), GATE-тест `tensor_parallel.cpp` написаны. **GATE по сборке не подтверждён**: тулчейн (cl 14.44/cmake/ninja) есть, но ВСЕ сабмодули пусты (`git submodule status` → все с `-`; напр. `thirdparty/ittapi/ittapi`, `gtest`, `json/nlohmann_json`, `ocl/*`, `intel_gpu/thirdparty/onednn_gpu` = 0 файлов) → cmake configure падает (`ittapi::ittnotify does not represent a cmake target`). Инициализация сабмодулей = сетевой fetch → запрещён политикой. См. «Блокеры» |
+| 2026-10-17 | S05 Stage1.2 TPInferRequest | **частично** (код+тест готовы) | Заглушка rank-0 заменена на `TPInferRequest` (`include/.../tp/tp_infer_request.hpp`, `src/.../tp/tp_infer_request.cpp`): k per-rank sub-запросов, репликация входов (общий host-тензор в `set_tensor` + memcpy rank0→rankN в `infer()` для lazy-буферов), выходы только rank0; `infer()` — последовательно по рангам (MVP). `TPCompiledModel::create_infer_request()` → `create_async_infer_request<>()` (обёртка `ov::IAsyncInferRequest` на выделенном `CPUStreamsExecutor`), `create_sync_infer_request()` → `TPInferRequest`. GATE-тест `TensorParallelInferMatchesSingleGpu` (паритет TP2 vs 1-GPU, доп. модель `make_tp_parity_model` с различными весами, SKIP <2 GPU). **GATE по сборке/прогону не подтверждён** — сабмодули по-прежнему пусты (см. S04/«Блокеры»)
 
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
@@ -55,7 +56,34 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
-- **S04 done (частично, 2026-10-17)** — Stage 1.1 TPCoordinator. Артефакты:
+- **S05 done (частично, 2026-10-17)** — Stage 1.2 TPInferRequest. Артефакты:
+  - Новый sync-запрос `TPInferRequest` (`src/plugins/intel_gpu/include/intel_gpu/plugin/tp/tp_infer_request.hpp`,
+    `src/plugins/intel_gpu/src/plugin/tp/tp_infer_request.cpp`): держит `m_rank_requests`
+    (по `rank_model->create_sync_infer_request()` на каждый ранг из `TPCompiledModel::get_rank_models()`).
+  - `TPCompiledModel::create_sync_infer_request()` → `TPInferRequest`; `create_infer_request()` →
+    `create_async_infer_request<>()` (дефолтная `ov::IAsyncInferRequest`; в S05 добавляется свой
+    `CPUStreamsExecutor` в ctor через `set_task_executor`, т.к. база создаётся с `nullptr` executor).
+  - **Контракт реплики**: `set_tensor(input)` → один и тот же host-тензор ставится во ВСЕ ранговые
+    запросы; `set_tensor(output)` → только rank0. `infer()` перед стартом вызывает
+    `replicate_inputs()`: для каждого input-порта, если rank0- и rankN-тензоры — разные указатели
+    (lazy-аллокация, каждый ранг создал свой буфер), `memcpy` rank0→rankN (device/remote тензоры
+    отклоняются — `OPENVINO_ASSERT`; строки копируются поэлементно). Затем последовательный
+    `rank->infer()`. `get_tensor`/`get_tensors` — из rank0; `query_state` — rank0 (агрегация per-rank
+    KV/linear-attn — S10/S11); `get_profiling_info` — с префиксом `rankN:`; `check_tensors` — no-op.
+  - **Осознанно НЕ делалось** (S06+): шардинг/`TPShardTransform`, коллективы, device-side швы,
+    batched (`set_tensors`>1 → `NOT_IMPLEMENTED`), per-rank state.
+- **GATE-тест S05**: расширен `src/plugins/intel_gpu/tests/functional/behavior/tensor_parallel.cpp`:
+  `make_tp_parity_model()` (MatMul 8×16 с различающимися знакопеременными весами) +
+  `TensorParallelInferMatchesSingleGpu` (reference `"GPU"` vs TP `TENSOR_PARALLEL`, `ov::test::utils::compare`
+  abs/rel 1e-4, SKIP при <2 GPU). Негативы S04 (`"GPU.0"`+TP, `PIPELINE_PARALLEL`) сохранены.
+- **Заметка для S06**: тест/GATE S05 не прогонялся (сборка недоступна, сабмодули пусты). Перед S06
+  нужно ревью кода; при появлении сабмодулей — собрать GPU-плагин + `tensor_parallel` тест, получить
+  зелёный паритет (тогда S04+S05 GATE закрываются постфактум). S06 начинает `TPShardTransform`:
+  identity/скелет-пасс, детект MatMul/FC и заполнение `TPPlan.seams`, без изменения численного
+  результата (паритет должен сохраняться). Точка вставки пасса — `TransformationsPipeline::apply`
+  (`transformations_pipeline.cpp:555+`), ДО фьюжнов и `propagate_constants` (срез весов — до upload,
+  PLAN §4.2, risk §7.2).
+- **S04 (для контекста)** — Stage 1.1 TPCoordinator. Артефакты:
   - Свойства: `ov::intel_gpu::tp_ranks` (RO, `std::vector<int32_t>`) и
     `ov::intel_gpu::enable_tensor_parallel` (RW, bool) —
     `include/intel_gpu/runtime/internal_properties.hpp`; опции
