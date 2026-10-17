@@ -14,6 +14,7 @@ namespace ov::intel_gpu {
 
 namespace {
 constexpr const char* TP_SEAMS_RT_INFO_KEY = "intel_gpu_tp_seams";
+constexpr const char* TP_OUTPUT_SEAMS_RT_INFO_KEY = "intel_gpu_tp_output_seams";
 }  // namespace
 
 size_t TPPlan::num_sharded_seams() const {
@@ -24,6 +25,15 @@ size_t TPPlan::num_sharded_seams() const {
         }
     }
     return count;
+}
+
+const TPOutputSeam* TPPlan::find_output_seam(size_t output_index) const {
+    for (const auto& seam : output_seams) {
+        if (seam.output_index == output_index) {
+            return &seam;
+        }
+    }
+    return nullptr;
 }
 
 const char* to_string(TPSeamKind kind) {
@@ -50,8 +60,16 @@ std::string tp_seam_to_string(const TPSeam& seam) {
            seam.node_type + ":" + seam.node_name;
 }
 
+std::string tp_output_seam_to_string(const TPOutputSeam& seam) {
+    return seam.producer_node + ":" + std::to_string(seam.split_axis) + ":" + std::to_string(seam.shard_dim_size);
+}
+
 const char* tp_seams_rt_info_key() {
     return TP_SEAMS_RT_INFO_KEY;
+}
+
+const char* tp_output_seams_rt_info_key() {
+    return TP_OUTPUT_SEAMS_RT_INFO_KEY;
 }
 
 void set_tp_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPSeam> seams) {
@@ -71,6 +89,25 @@ std::vector<TPSeam> get_tp_seams(const std::shared_ptr<const ov::Model>& model) 
         return {};
     }
     return it->second.as<std::vector<TPSeam>>();
+}
+
+void set_tp_output_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPOutputSeam> seams) {
+    if (!model) {
+        return;
+    }
+    model->get_rt_info()[TP_OUTPUT_SEAMS_RT_INFO_KEY] = std::move(seams);
+}
+
+std::vector<TPOutputSeam> get_tp_output_seams(const std::shared_ptr<const ov::Model>& model) {
+    if (!model) {
+        return {};
+    }
+    const auto& rt_info = model->get_rt_info();
+    auto it = rt_info.find(TP_OUTPUT_SEAMS_RT_INFO_KEY);
+    if (it == rt_info.end()) {
+        return {};
+    }
+    return it->second.as<std::vector<TPOutputSeam>>();
 }
 
 }  // namespace ov::intel_gpu

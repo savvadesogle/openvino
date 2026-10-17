@@ -1,135 +1,130 @@
-# СЕССИЯ S07 — Stage 2.2 N-split + all-gather-эквивалент (срез весов до upload) · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
+# СЕССИЯ S08 — Stage 2.3 K-split + allreduce (fp32-аккум, bias в reducer, швы-события) · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
 
 ## Как работать
 - Сначала полностью прочитай:
   1) C:\openvino-tp\PLAN.md — канон (НЕ редактировать в сессии), особенно §4.2 (compile-time, место
-     TP-пасса и срез констант), §4.3 (N-split по головам/каналам, allgather-эквивалент), §5 (строка S07),
-     §7 (риски: фьюжны через шов, срез до `propagate_constants`).
-  2) C:\openvino-tp\STATE.md — живое состояние, особенно «Заметки сессия → следующая» блок **S06→S07**
-     (что уже сделано: `TPShardTransform`, rt_info-транспорт, `tp_seams`), а также S04/S05
-     (`TPCoordinator`, `TPCompiledModel`, `TPInferRequest`) и «Блокеры» (сборка недоступна).
-  3) C:\openvino-tp\docs\notes\gpu-plugin-arch.md — §3 (где пасс и почему срез до `propagate_constants`).
-  4) C:\openvino-tp\docs\notes\cpu-tp-pattern.md — §5–§6 (N-split FC, allgather = конкатенация без
-     арифметики; численные инварианты).
-- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S07 (таблица PLAN.md §5). Следующие
-  этапы (S08+ — K-split/allreduce, коллективы, per-rank KV) ЗАПРЕЩЕНЫ. Остановка на GATE/блокере —
-  нормальный результат; зафиксируй его в STATE.md.
+     TP-пасса, срез до `propagate_constants`), §4.3 (K-split O-proj/down-proj + allreduce(sum), bias в
+     reducer), §4.4 (runtime, швы-события), §5 (строка S08), §7.4 (fp16-суммы → fp32-аккум).
+  2) C:\openvino-tp\STATE.md — живое состояние, особенно «Заметки сессия → следующая» блок **S07→S08**
+     (что уже сделано: N-split срез, TPOutputSeam/assembly, rank-plumbing) и S04–S06.
+  3) C:\openvino-tp\docs\notes\cpu-tp-pattern.md — §5–§6 (allgather = конкатенация; CPU K-split/allreduce
+     ОТСУТСТВУЕТ — проектируем с нуля).
+  4) C:\openvino-tp\docs\notes\gpu-plugin-arch.md — §3–§4 (pass до propagate_constants; очереди/события).
+  5) C:\openvino-tp\docs\notes\l0-spike.md — §8 (G0 = host-USM staging; host-sync floor ~60–90 µs).
+- Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = S08 (таблица PLAN.md §5). Следующие этапы
+  (S09+ — int4_ASYM, per-rank KV, device-side коллективы/события как прод-путь) ЗАПРЕЩЕНЫ. Остановка на
+  GATE/блокере — нормальный результат; зафиксируй его в STATE.md.
 
 ## Контекст, который УЖЕ исполнен (не повторять)
 - S01–S03 done: ветка `feature/gpu-tensor-parallel`; L0-спайки (2× A770; peer/IPC NA). **G0 = host-USM
-  staging** (dev→pinned host→dev, ~4–5 GB/s e2e) — транспорт для будущих коллективов; в S07 его ещё НЕ
-  подключать (см. ограничения ниже).
-- S04 done (частично): `TPCoordinator`/`TP-ветка compile_model`/свойства (`tp_ranks`,
+  staging** (dev→pinned host→dev, ~4–5 GB/s e2e). Device-side швы — S12; на S08 допустима host-сборка.
+- S04 done (частично): `TPCoordinator`/TP-ветка `compile_model`/свойства (`tp_ranks`,
   `enable_tensor_parallel`, `model_distribution_policy`).
-- S05 done (частично): `TPInferRequest` (k per-rank sub-запросов, репликация входов, выходы rank-0,
-  последовательный infer); `TPCompiledModel::create_*_infer_request`.
-- **S06 done (частично):** identity/analysis пасс `TPShardTransform`
-  (`src/plugins/intel_gpu/src/plugin/transformations/tp_shard_transform.{hpp,cpp}`):
-  - `ov::pass::ModelPass`, возвращает `false`; регистрируется в `TransformationsPipeline::apply` **только
-    при TP** (policy{TENSOR_PARALLEL} ИЛИ `enable_tensor_parallel`), сразу после
-    `set_per_pass_validation(false)`, до `SDPAToVLSDPA`/фьюжнов/LowPrecision (и семантически до
-    `propagate_constants` — PLAN §4.2/§7.2). MatMul ещё не сконвертирован в FC в этот момент.
-  - Детектит `MatMul`/`FullyConnected`(`Compressed`), классифицирует: нет константных весов (операнд 1)
-    → `REPLICA`; выход фида в `ov::op::v1::Add` → `K_SPLIT`(`ALL_REDUCE_SUM`); иначе → `N_SPLIT`
-    (`ALL_GATHER`). Пишет `std::vector<TPSeam>` в `model->get_rt_info()["intel_gpu_tp_seams"]`.
-  - `TPPlan`/`TPSeamKind{NONE,N_SPLIT,K_SPLIT,REPLICA}`/`TPCollectiveKind{NONE,ALL_GATHER,ALL_REDUCE_SUM}`
-    (`include/intel_gpu/plugin/tp/tp_plan.hpp` + `src/plugin/tp/tp_plan.cpp`: `set_tp_seams`/`get_tp_seams`).
-  - `TPCoordinator::compile_model_tensor_parallel` после `clone_and_transform_model` ранга-0 собирает
-    `plan.seams = get_tp_seams(transformed_model)`.
-  - RO-свойство `ov::intel_gpu::tp_seams` (`vector<string>` формат `KIND:COLLECTIVE:TYPE:NAME`).
-  - Тесты S06 в `src/plugins/intel_gpu/tests/functional/behavior/tensor_parallel.cpp`.
-- **Среда сборки НЕДОСТУПНА**: тулчейн есть (cl 14.44/cmake/ninja), но **все git-сабмодули пусты**
-  (`git submodule status` → все с `-`), cmake configure падает; инициализация = сетевой fetch (запрещён).
-  См. STATE «Блокеры». Если сабмодули появились — собери GPU-плагин + тест `tensor_parallel`; иначе
-  честный частичный GATE.
-- **КРИТИЧНО (архитектурный факт S06):** сейчас `clone_and_transform_model` клонирует одну и ту же
-  модель для КАЖДОГО ранга с одинаковым config → пасс не знает свой rank. Для реального среза в S07
-  ранг нужно прокинуть в пасс (или в config per-rank). Реши это ДО среза (см. п.1).
+- S05 done (частично): `TPInferRequest` (k per-rank sub-запросов, репликация входов, последовательный
+  infer, выходы через `TPCompiledModel`).
+- S06 done (частично): `TPShardTransform` детектит `MatMul`/`FullyConnected(Compressed)` и классифицирует:
+  нет константных весов → `REPLICA`; выход фида в `ov::op::v1::Add` → `K_SPLIT`(`ALL_REDUCE_SUM`); иначе
+  → `N_SPLIT`(`ALL_GATHER`). Пишет `std::vector<TPSeam>` в rt_info `intel_gpu_tp_seams`.
+- **S07 done (частично):** реальный N-split + host all-gather-эквивалент.
+  - Rank прокинут в пасс (Вариант A): internal-опции `ov::intel_gpu::tp_rank`/`tp_num_ranks`
+    (`internal_properties.hpp`+`options.inl`), штампуются `TPCoordinator`
+    `set_property` в per-rank config; `TransformationsPipeline::apply` →
+    `register_pass<TPShardTransform>(config.get_tp_rank(), config.get_tp_num_ranks())`.
+  - `TPShardTransform` для `N_SPLIT` с константными весами режет Constant по N-оси (`slice_constant`,
+    `offset=rank*N/ranks`; ось по `transpose_b`), режет bias (input 2), заполняет
+    `TPSeam.split_axis=-1`/`shard_dim_size=N`, возвращает `true`. Sub-byte (int4) — throw (S09).
+    Fallback при неделимости/небезопасном потребителе → `REPLICA` без throw.
+  - **K_SPLIT/REPLICA узлы сейчас НЕ режутся** — копируются целиком на каждый ранг
+    (это то, что делает S08).
+  - All-gather outputs: `TPOutputSeam` (rt_info `intel_gpu_tp_output_seams` → `TPPlan.output_seams`),
+    `TPCompiledModel::build_output_ports()` публикует полный синтетический порт,
+    `TPInferRequest::assemble_outputs()` конкатенирует регионы rank-выходов (host, без арифметики).
+  - Тесты S07: `NsplitMlpParityMatchesSingleGpu`, `NsplitNotDivisibleFallsBackToReplica`.
 
-## Задача S07 (полный объём этой сессии)
-Stage 2.2 — **N-split + all-gather-эквивалент**: впервые реально менять граф. Для узлов, помеченных
-`N_SPLIT`, срезать константные веса по выходным каналам (out-channels, N-ось) так, чтобы на устройство
-каждого ранга уезжал только его слайс (срез — на OV-уровне, ДО `propagate_constants`/upload). Собрать
-полный выходной буфер результата на каждом ранге без арифметики (all-gather = конкатенация слайсов).
-K-split/allreduce и K_SPLIT-узлы в этой сессии НЕ реализовывать (S08).
+## Задача S08 (полный объём этой сессии)
+Stage 2.3 — **K-split + allreduce**: для узлов, помеченных `K_SPLIT` (residual-проекции: O-proj,
+MLP down-proj, linear-attention out-proj), срезать константные веса по оси сокращения (K) так, чтобы на
+устройство каждого ранга уезжал только его K-слайс (на OV-уровне, ДО `propagate_constants`/upload).
+Результат каждого ранга — частичная GEMM-сумма; собрать полный результат суммированием частичных
+(все-редеью(sum), fp32-аккумуляция). K-split/allreduce должен работать вместе с уже реализованным N-split.
 
-1. **Прокидывание rank в пасс (обязательный предусловие).**
-   - Вариант A (рекомендован): в `TPCoordinator::compile_model_tensor_parallel` перед
-     `clone_and_transform_model` положить rank в per-rank `ExecutionConfig` (напр. новый internal-option
-     `ov::intel_gpu::tp_rank` / или уже существующий механизм) и в `TransformationsPipeline::apply`
-     передать/выставить его в `TPShardTransform(rank, num_ranks)`.
-   - Вариант B: обернуть пасс в отдельный вызов после `clone_and_transform_model` по рангу (но потеряется
-     позиция «до фьюжнов» — НЕ рекомендуем).
-   - Зафиксируй выбор и мотивацию в STATE. Не ломай TP-off (`tp_rank` отсутствует → пасс не запускается).
+1. **K-split срез весов (K-ось).**
+   - В `TPShardTransform` для `kind == K_SPLIT` и константных весов: срезать веса по K-оси.
+     Для `MatMul` с `transpose_b=false` веса `[K, N]` → срез по axis 0 (`[k_start:k_end, :]`); при
+     `transpose_b=true` веса `[N, K]` → срез по axis 1. Для `op::FullyConnected` — учесть `transpose_b`.
+   - **Вход активации тоже надо срезать по K** (это отличие от N-split!): A-операнд (input 0) — не
+     константа, поэтому K-срез входа делается... варианты: (а) на S08 допускается оставить A полным, но
+     тогда нужен K-split только по весам и суммирование частичных N-полных выходов — это корректно
+     ТОЛЬКО если каждый ранг считает `A_full @ W[:, k_r]`, что даёт частичную сумму по k_r (нужно
+     суммировать по рангам) — но тогда каждый ранг держит полный A и полный выход N, экономя лишь
+     веса по K. Уточни/зафиксируй решение и его численный инвариант в STATE. Приоритет — корректность
+     паритета; K-срез активаций (если требуется) — в этом же пассе через `StridedSlice` по последней
+     оси A с границами кратными group_size (для int4 — S09).
+   - Численные инварианты (PLAN §2): K-границы кратны `group_size` (=128 для int4); bias НЕ резать
+     (добавляется один раз в reducer).
+   - **scales/zp** не трогать (int4 — S09), но не сломать.
+   - Не регрессировать N-split (S07): N и K срезы должны корректно сосуществовать в одном пассе.
 
-2. **Срез констант (N-split, out-channels).**
-   - В `TPShardTransform` (или новом `TPNsplitTransform`, регистрируемом там же) для каждого узла с
-     `kind == N_SPLIT` и константным операндом-весами:
-     - заменить Constant-веса на слайс по N-оси для своего ранга. Для `MatMul` с `transpose_b=false`
-       веса `[K, N]` → срез по axis 1 (`[K, n_start:n_end]`); при `transpose_b=true` учитывать раскладку.
-       Для `op::FullyConnected` (`transpose_b` атрибут) — аналогично.
-     - срез делать **целыми N-группами** (кратно group_size для int4 — PLAN §2; на S07 тест fp32/f16, но
-       хелпер сразу параметризовать по group-границам и падать с внятной ошибкой, если N не делится).
-     - **bias/scales/zp**: bias (если есть) режется по той же оси вместе с весами; scales/zp на S07
-       можно не трогать (int4 — S09), но не сломать их наличие.
-     - **НЕ резать K-ось** и не трогать `K_SPLIT`/`REPLICA` узлы (S08).
-   - Численный инвариант: результат каждого ранга — часть N-оси; для проверки в тесте можно взять модель,
-     где N-split очевиден (MLP: hidden→FC (N=2*intermediate) → ... → FC).
+2. **Allreduce(sum) — сборка полного результата.**
+   - Host-side достаточно на S08 (device-side staging/события — S12, см. G0): после инференса все ранги
+     отдают свои частичные результаты; reducer суммирует их в fp32 и кладёт в выходной буфер rank-0.
+   - **bias добавляется ОДИН раз** (после суммирования), а не в каждом ранге.
+   - **fp32-аккумуляция** обязательна (fp16-суммы запрещены, PLAN §7.4): читать частичные в fp32,
+     суммировать, только затем кастовать к выходному типу.
+   - Контракт выходов S05 сохранить: выходы только на rank-0, полный тензор.
+   - Расширить `TPPlan`/rt_info новым механизмом (аналог `TPOutputSeam`, но с `TPCollectiveKind::
+     ALL_REDUCE_SUM` и списком рангов-участников), не ломая `output_seams` (N-split/all-gather).
+   - `TPInferRequest::assemble_outputs()` уже владеет выходными буферами — добавить ветку allreduce:
+     для output-seam с `ALL_REDUCE_SUM` суммировать per-rank выходы (fp32) в dst rank-0.
+   - Определение всех выходов, требующих allreduce: model-output, достижимый из `K_SPLIT`-узла (через
+     elementwise/none). Возможно понадобится объединить N- и K-выходы в один список с полем коллектива.
 
-3. **All-gather-эквивалент (сборка полного буфера без арифметики).**
-   - На S07 достаточно **host-side**/логической сборки: после N-split каждый ранг считает свой слайс;
-     для получения полного выхода потребителя (или model output) собрать слайсы рангов в правильном
-     порядке (конкатенация по N-оси) — без суммирования. Минимальный вариант: собрать на rank-0
-     (например, через существующий `TPInferRequest`, копируя выходы рангов в общий буфер). Реальный
-     device-side/коллективный транспорт (host-USM staging, IPC-события) — S08/S12; на S07 допускается
-     простая host-сборка, но она должна давать корректный полный результат.
-   - ВАЖНО: контракт выходов S05 (выходы только rank-0) сохранить; если выход модели N-split-узла, то
-     rank-0 должен отдать ПОЛНЫЙ тензор, а не свой слайс.
-   - Если полная сборка на S07 не влезает в этап — честно ограничить сценарий тестом, где N-split узел
-     имеет потребителя, не требующего полного N (напр. два независимых N-split FC с разными выходами;
-     или проверять поэлементно по слайсам). Задокументировать компромисс в STATE.
+3. **Швы-события (минимально).**
+   - На S08 достаточно host-синхронной сборки (S07-стиль). Реальные device-side швы (IPC-события,
+     staging-буферы, `SubMemoryManager`-аналог) — S12. Если решишь ввести заготовку событий — не выходи
+     за рамки этапа; журнал решений — в STATE.
 
-4. **Не ломать S04/S05/S06.**
-   - Паритет `TensorParallelInferMatchesSingleGpu` и все S04-негативы и S06-seams-тесты должны
-     продолжать проходить (после N-split паритет станет нетривиальным — это и есть суть S07).
-   - `TPPlan.seams` не деградировать; при срезе можно дополнить `TPSeam` полями (axis/группы) — тогда
-     обнови `tp_seams`-строку и тесты.
+4. **Не ломать S04/S05/S06/S07.**
+   - Паритеты `TensorParallelInferMatchesSingleGpu` (S05), `NsplitMlpParityMatchesSingleGpu` (S07),
+     S04-негативы, S06-seams-тесты, TP-off регресс — должны оставаться зелёными по коду/логике.
+   - `tp_seams` формат стабилен (или расширяй строку согласованно, обновив тесты).
 
-5. **Тесты/GATE** (`src/plugins/intel_gpu/tests/functional/behavior/tensor_parallel.cpp` или соседний
-   файл того же каталога — ROOT-glob подхватит без правки CMake):
-   - **Главный GATE:** FC/MLP-мини-сеть (Parameter → N-split FC → N-split consumer → Result) собирается
-     в TP2, каждый ранг получает СВОЙ слайс весов (проверить через срез/собрать полный выход),
-     полный результат совпадает с 1-GPU референсом с `cos > 0.999` (и abs/rel, где применимо). SKIP <2 GPU.
-   - Негатив: N, не делящееся на число рангов → внятная ошибка (OPENVINO_THROW) или корректный
-     fallback на REPLICA (решить и задокументировать).
-   - TP-off регресс: обычная компиляция не срезает веса, `tp_seams == {}` при TP-off.
-   - Опц.: детект/срез на Qwen LM (24 linear + 8 full attention) — если модель и сборка доступны;
-     иначе частичный GATE.
+5. **Тесты/GATE** (`src/plugins/intel_gpu/tests/functional/behavior/tensor_parallel.cpp` или соседний файл
+   того же каталога — ROOT-glob подхватит без правки CMake):
+   - **Главный GATE S08:** residual-проекция (Parameter → MatMul(weights) → Add(residual) → Result, где
+     MatMul классифицируется как `K_SPLIT`) собирается в TP2; частичные результаты рангов суммируются
+     (allreduce) и полный выход совпадает с 1-GPU референсом с `cos > 0.999` (и abs/rel). SKIP <2 GPU.
+     Проверить, что bias (если есть) добавлен ровно один раз.
+   - Комбинированный тест (опц.): N-split → elementwise → K-split (residual) — если срез активаций не
+     реализован, честно ограничить сценарий и задокументировать.
+   - TP-off регресс: без TP веса не режутся, `tp_seams == {}`.
+   - Опц.: K-split на Qwen (24 linear + 8 full attention) — если модель и сборка доступны; иначе частичный GATE.
+   - Негатив: K, не делящийся на число рангов/на group_size → fallback `REPLICA` (как в S07) либо
+     `OPENVINO_THROW` — выбери и задокументируй.
 
 6. **Регистрация**: новые `.cpp` под `src/plugin/**` подхватывает `file(GLOB_RECURSE PLUGIN_SOURCES
    src/plugin/*.cpp ...)` (`src/plugins/intel_gpu/CMakeLists.txt:147`); тест — ROOT-glob. Правок CMake
    быть не должно.
 
-## GATE S07 (критерии завершения)
-- N-split реализован: константные веса `N_SPLIT`-узлов срезаны по out-channels ДО upload (на OV-уровне,
-  в TP-пассе до `propagate_constants`); на устройство ранга едет только его слайс.
-- All-gather-эквивалент даёт корректный полный результат (host-сборка допустима на этом этапе).
-- GATE-тест: FC/MLP-сеть паритет TP2 vs 1-GPU `cos > 0.999` (при недоступной сборке — код+план теста,
-  честная пометка «частично»).
-- `TPPlan`/`tp_seams` остаются стабильными; K_SPLIT/REPLICA узлы не тронуты; TP-off == upstream.
-- STATE.md: S07 done/блокер + артефакты + решения (выбор механизма rank, способ сборки) + заметки → S08.
-- NEXT.md — полный самодостаточный промпт S08 (K-split + allreduce: fp32-аккумуляция, bias в reducer,
-  швы-события; GATE — паритет на K-split тесте).
-- Commit (сообщение: "S07: N-split + all-gather equivalent (weight slicing before upload)") —
-  **локально, без push**.
+## GATE S08 (критерии завершения)
+- K-split реализован: константные веса `K_SPLIT`-узлов срезаны по K-оси ДО upload; на устройство ранга
+  едет только его K-слайс.
+- Allreduce(sum) с fp32-аккумуляцией даёт корректный полный результат; bias добавлен один раз.
+- GATE-тест: residual-проекция паритет TP2 vs 1-GPU `cos > 0.999` (при недоступной сборке — код+план
+  теста, честная пометка «частично»).
+- N-split (S07) не сломан; `TPPlan`/`tp_seams` стабильны; TP-off == upstream.
+- STATE.md: S08 done/блокер + артефакты + решения (K-cut активации, механизм allreduce, bias) + заметки → S09.
+- NEXT.md — полный самодостаточный промпт S09 (int4_ASYM: веса+scales/zp до group-границ, K кратно 128;
+  GATE — Qwen3.5-9B-int4 TP2 prefill паритет).
+- Commit (сообщение: "S08: K-split + allreduce (fp32 accumulation, bias in reducer)") — **локально, без push**.
 
 ## Жёсткие ограничения
 - **Только локально: remote (origin/upstream) НЕ трогаем** — никаких push/pull/изменений удалённого
   репозитория, включая `git submodule update` (сетевой fetch).
-- Атомарность этапа: НЕ реализовывать S08+ (K-split/allreduce, device-side коллективы, per-rank KV,
-  int4-специфичный срез S09). S07 = только N-split + all-gather-эквивалент.
+- Атомарность этапа: НЕ реализовывать S09+ (int4_ASYM group-срез, per-rank KV, device-side коллективы/
+  события как прод-путь, linear_attention). S08 = только K-split + allreduce.
 - Не коммитить .bin/модельные файлы; секреты не писать в файлы/логи/историю.
 - `PLAN.md` в сессии не редактировать; дельты — в STATE.md.
 - Попутные находки — в STATE «Заметки сессия → следующая» или docs/notes/.
-- Если нужна сборка OpenVINO и она недоступна (сабмодули пусты) — не изобретать обходные сборки;
-  зафиксировать блокер в STATE и считать GATE частичным (код + план теста готовы).
+- Если сборка OpenVINO недоступна (сабмодули пусты) — не изобретать обходные сборки; зафиксировать
+  блокер в STATE и считать GATE частичным (код + план теста готовы).

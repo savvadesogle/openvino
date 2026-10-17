@@ -48,6 +48,25 @@ static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_s
 static constexpr Property<bool, PropertyMutability::RW> enable_tensor_parallel{"ENABLE_TENSOR_PARALLEL"};
 
 /**
+ * @brief Internal per-rank coordinate used while compiling a tensor-parallel model.
+ * The TPCoordinator stamps each rank's ExecutionConfig with its rank index and the total
+ * number of ranks before cloning/transforming the model, so that TPShardTransform can slice
+ * the constant weights for exactly that rank (S07). -1 means "not a TP rank" and disables
+ * weight slicing (the pass stays an analysis-only identity, as in S06).
+ *
+ * [TP-GPU, S07] Experimental GPU tensor-parallel support. See PLAN.md §4.2.
+ */
+static constexpr Property<int32_t, PropertyMutability::RW> tp_rank{"TP_RANK"};
+
+/**
+ * @brief Internal total number of tensor-parallel ranks (see ov::intel_gpu::tp_rank).
+ * Values <= 1 disable weight slicing.
+ *
+ * [TP-GPU, S07] Experimental GPU tensor-parallel support. See PLAN.md §4.2.
+ */
+static constexpr Property<int32_t, PropertyMutability::RW> tp_num_ranks{"TP_NUM_RANKS"};
+
+/**
  * @brief Read-only property to get GPU device_id
  */
 static constexpr Property<std::string, PropertyMutability::RO> device_id{"GPU_DEVICE_ID"};

@@ -13,6 +13,7 @@
 #include <memory>
 #include <vector>
 
+#include "intel_gpu/plugin/tp/tp_plan.hpp"
 #include "openvino/runtime/isync_infer_request.hpp"
 #include "openvino/runtime/so_ptr.hpp"
 
@@ -55,7 +56,17 @@ private:
     // Ensures every rank sees the same input data as rank 0 before execution.
     void replicate_inputs();
 
+    // [S07] Assembles the full model outputs on rank 0 from the per-rank N-slices
+    // (all-gather equivalent: concatenation, no arithmetic). Replicated outputs are copied
+    // over from rank 0 verbatim.
+    void assemble_outputs();
+
+    // Lazily allocates the host output tensor exposed for port @p index (full shape).
+    ov::SoPtr<ov::ITensor>& output_tensor(size_t index) const;
+
     std::vector<ov::SoPtr<ov::ISyncInferRequest>> m_rank_requests;
+    // Owned outputs, indexed by model output index (one entry per output port).
+    mutable std::vector<ov::SoPtr<ov::ITensor>> m_output_tensors;
 };
 
 }  // namespace ov::intel_gpu

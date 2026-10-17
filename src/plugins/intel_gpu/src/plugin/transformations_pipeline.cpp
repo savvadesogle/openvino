@@ -654,7 +654,10 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
             config.get_enable_tensor_parallel() ||
             config.get_model_distribution_policy().count(ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL) > 0;
         if (tp_requested) {
-            manager.register_pass<ov::intel_gpu::TPShardTransform>();
+            // [S07] The TPCoordinator stamps each rank's config with tp_rank/tp_num_ranks so
+            // the pass slices the constant weights for exactly this rank (before fusions and,
+            // semantically, before propagate_constants -> only the rank's slice is uploaded).
+            manager.register_pass<ov::intel_gpu::TPShardTransform>(config.get_tp_rank(), config.get_tp_num_ranks());
         }
 
         // Transformation of SDPA to VLSDPA for QWen2.x-VL,

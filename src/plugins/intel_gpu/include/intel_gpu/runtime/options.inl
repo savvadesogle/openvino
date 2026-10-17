@@ -23,6 +23,8 @@ OV_CONFIG_RELEASE_OPTION(ov, cache_dir, "", "Directory where model cache can be 
 OV_CONFIG_RELEASE_OPTION(ov, num_streams, 1, "Number of streams to be used for inference")
 OV_CONFIG_RELEASE_OPTION(ov::hint, model_distribution_policy, std::set<ov::hint::ModelDistributionPolicy>{}, "Model distribution policy across devices. The GPU plugin supports {TENSOR_PARALLEL} only")
 OV_CONFIG_RELEASE_OPTION(ov::intel_gpu, enable_tensor_parallel, false, "Internal/test flag enabling tensor-parallel compilation (equivalent to model_distribution_policy={TENSOR_PARALLEL})")
+OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, tp_rank, -1, "Internal tensor-parallel rank index used to slice constant weights; -1 disables slicing")
+OV_CONFIG_RELEASE_INTERNAL_OPTION(ov::intel_gpu, tp_num_ranks, 1, "Internal tensor-parallel group size used to slice constant weights; <=1 disables slicing")
 OV_CONFIG_RELEASE_OPTION(ov, compilation_num_threads, std::max(1, static_cast<int>(std::thread::hardware_concurrency())), "Max number of CPU threads used for model compilation for the stages that supports parallelism")
 OV_CONFIG_RELEASE_OPTION(ov::hint, inference_precision, ov::element::f16, "Model floating-point inference precision. Supported values: { f16, f32, bf16, dynamic }", [](ov::element::Type t) { return t == ov::element::f16 || t == ov::element::f32 || t == ov::element::bf16 || t == ov::element::dynamic; })
 OV_CONFIG_RELEASE_OPTION(ov::hint, model_priority, ov::hint::Priority::MEDIUM, "High-level hint that defines the priority of the model. It may impact number of threads used for model compilation and inference as well as device queue settings")

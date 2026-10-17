@@ -68,11 +68,30 @@ struct TPSeam {
 };
 
 /**
+ * @brief Describes a model output that is produced (possibly through a chain of purely
+ * element-wise operations) by an N-split GEMM and therefore must be assembled from the
+ * per-rank slices on rank 0 - the all-gather equivalent (S07).
+ *
+ * With an equal split the rank-r slice spans [rank_r * (shard_dim_size / num_ranks),
+ * (rank_r + 1) * (shard_dim_size / num_ranks)) along split_axis.
+ */
+struct TPOutputSeam {
+    //! Index of the model output (into ov::Model::outputs()).
+    size_t output_index = 0;
+    //! Axis along which the full tensor is sharded (negative = counted from the end, -1 = last).
+    int64_t split_axis = -1;
+    //! Size of the sharded dimension in the FULL (unsharded) tensor.
+    int64_t shard_dim_size = -1;
+    //! Friendly name of the N-split GEMM that produces this output (debug/introspection).
+    std::string producer_node;
+};
+
+/**
  * @brief Compile-time tensor-parallel plan.
  *
- * Describes the participating ranks (and their device ids) plus the classified seams
- * detected by TPShardTransform. The structure is deliberately minimal so that later
- * stages can extend it without touching the public API.
+ * Describes the participating ranks (and their device ids), the classified seams detected
+ * by TPShardTransform and the model outputs that require an all-gather (S07). The structure
+ * is deliberately minimal so that later stages can extend it without touching the public API.
  */
 struct TPPlan {
     //! Rank indices, e.g. {0, 1} for a 2-GPU TP group.
@@ -82,11 +101,15 @@ struct TPPlan {
     std::vector<std::string> rank_device_ids;
     //! Classified seams (one entry per detected MatMul/FC), in deterministic graph order.
     std::vector<TPSeam> seams;
+    //! Model outputs that must be assembled from per-rank slices (all-gather, S07).
+    std::vector<TPOutputSeam> output_seams;
 
     bool tp_enabled() const { return ranks.size() > 1; }
     size_t num_ranks() const { return ranks.size(); }
     //! Number of seams that will actually require a collective (N_SPLIT/K_SPLIT).
     size_t num_sharded_seams() const;
+    //! Finds the assembly descriptor for a model output index (nullptr if it is replicated).
+    const TPOutputSeam* find_output_seam(size_t output_index) const;
 };
 
 //! Stable string encodings used for logging and for the ov::intel_gpu::tp_seams property.
@@ -99,9 +122,21 @@ std::string tp_seam_to_string(const TPSeam& seam);
 //! The value has the plain type std::vector<TPSeam> (no registered attribute needed).
 const char* tp_seams_rt_info_key();
 
+//! Model rt_info key under which TPShardTransform stores the outputs that require an
+//! all-gather once the N-split weights have been sliced (S07).
+const char* tp_output_seams_rt_info_key();
+
+//! Encodes an output seam as "<producer>:<split_axis>:<shard_dim_size>" (logging/introspection).
+std::string tp_output_seam_to_string(const TPOutputSeam& seam);
+
 //! Stores the detected seams in the model rt_info (used by TPShardTransform).
 void set_tp_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPSeam> seams);
 //! Reads the seams previously stored by TPShardTransform (empty if none / non-TP model).
 std::vector<TPSeam> get_tp_seams(const std::shared_ptr<const ov::Model>& model);
+
+//! Stores the detected all-gather outputs in the model rt_info (used by TPShardTransform).
+void set_tp_output_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPOutputSeam> seams);
+//! Reads the all-gather outputs previously stored by TPShardTransform (empty if none).
+std::vector<TPOutputSeam> get_tp_output_seams(const std::shared_ptr<const ov::Model>& model);
 
 }  // namespace ov::intel_gpu

@@ -53,8 +53,18 @@ public:
     const std::vector<std::shared_ptr<CompiledModel>>& get_rank_models() const { return m_ranks; }
 
 private:
+    // Builds m_outputs: full-shape ports for N-split assembly outputs, native ports otherwise.
+    void build_output_ports();
+
     std::vector<std::shared_ptr<CompiledModel>> m_ranks;
     TPPlan m_plan;
+
+    // [S07] Model outputs as exposed to the user. Outputs produced by an N-split GEMM are
+    // advertised at their FULL (unsharded) shape even though each rank only materializes its
+    // slice; TPInferRequest assembles the full tensor from the per-rank slices on rank 0.
+    // Keeps alive the lightweight synthetic nodes backing the reshaped output ports.
+    std::vector<ov::Output<const ov::Node>> m_outputs;
+    std::vector<std::shared_ptr<ov::Node>> m_synthetic_output_nodes;
 };
 
 }  // namespace ov::intel_gpu

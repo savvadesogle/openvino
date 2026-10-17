@@ -10,7 +10,9 @@
 
 #include "intel_gpu/plugin/plugin.hpp"
 #include "intel_gpu/plugin/tp/tp_compiled_model.hpp"
+#include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/runtime/itt.hpp"
+#include "openvino/core/any.hpp"
 #include "openvino/runtime/properties.hpp"
 
 namespace ov::intel_gpu {
@@ -59,6 +61,8 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_tensor_parallel(const 
     // 1) Enumerate the TP group and build one independent per-rank context/config per device.
     //    One RemoteContextImpl == one device (remote_context.cpp requires devices.size() == 1),
     //    so we deliberately create k contexts rather than a single multi-device one.
+    const int32_t num_ranks = static_cast<int32_t>(m_device_map.size());
+
     std::vector<TPCoordinator::RankContext> rank_contexts;
     rank_contexts.reserve(m_device_map.size());
     int32_t rank = 0;
@@ -70,6 +74,14 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_tensor_parallel(const 
         rc.context = get_default_context(device_id);
         rc.config = m_configs_map.at(device_id);
         rc.config.set_user_property(orig_config, OptionVisibility::RELEASE);
+        // [S07] Stamp the per-rank coordinate so TransformationsPipeline can build
+        // TPShardTransform(rank, num_ranks) and slice the constant weights for this rank.
+        // Direct (non-finalized) option assignment survives the config clone/finalize in
+        // clone_and_transform_model and is read by the pass before nesting/fusion passes.
+        ov::AnyMap tp_props;
+        tp_props[ov::intel_gpu::tp_rank.name()] = ov::Any(rc.rank);
+        tp_props[ov::intel_gpu::tp_num_ranks.name()] = ov::Any(num_ranks);
+        rc.config.set_property(tp_props);
         rank_contexts.push_back(std::move(rc));
     }
 
@@ -77,18 +89,16 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_tensor_parallel(const 
     auto plan = coordinator.make_plan();
 
     // 2) Compile the model once per rank through the existing single-device path.
-    //    In S06 TPShardTransform is an identity/analysis pass: every rank receives the full
-    //    graph, but the detected seams are collected into the plan (see below).
+    //    TPShardTransform (S07) now slices the N_SPLIT weights per rank; the detected seams and
+    //    the all-gather outputs are collected from rank 0 (the geometry is rank-independent).
     std::vector<std::shared_ptr<CompiledModel>> rank_models;
     rank_models.reserve(coordinator.num_ranks());
     bool seams_collected = false;
     for (auto& rc : coordinator.ranks()) {
         auto transformed_model = clone_and_transform_model(model, rc.config, rc.context);
-        // [S06] TPShardTransform stamped the detected seams into the transformed model's
-        // rt_info. All ranks transform the identical graph, so rank 0 is representative;
-        // collect once to keep the plan deterministic and rank-independent.
         if (!seams_collected && rc.rank == 0) {
             plan.seams = get_tp_seams(transformed_model);
+            plan.output_seams = get_tp_output_seams(transformed_model);
             seams_collected = true;
         }
         rc.config.finalize(rc.context.get(), transformed_model.get());

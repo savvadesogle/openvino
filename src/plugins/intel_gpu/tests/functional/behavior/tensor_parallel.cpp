@@ -9,19 +9,29 @@
 //      the result must match a single-GPU reference inference (e2e parity).
 // S06: TPShardTransform (identity/analysis) detects MatMul/FullyConnected seams and reports
 //      them via ov::intel_gpu::tp_seams; the graph/numbers are unchanged (S05 parity holds).
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5 (S04, S05, S06).
+// S07: N-split - TPShardTransform slices the constant weights along the output-channel axis
+//      so each rank uploads only its slice; rank 0 assembles the full output (all-gather
+//      equivalent, host-side concatenation). Non-divisible N falls back to REPLICA.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5 (S04, S05, S06, S07).
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <numeric>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "common_test_utils/ov_tensor_utils.hpp"
+#include "openvino/core/except.hpp"
 #include "openvino/core/model.hpp"
+#include "openvino/core/type/bfloat16.hpp"
+#include "openvino/core/type/float16.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/relu.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
@@ -65,6 +75,78 @@ std::shared_ptr<ov::Model> make_tp_parity_model() {
     auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
     auto result = std::make_shared<ov::op::v0::Result>(matmul);
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_parity");
+}
+
+// [S07] An MLP-like column-parallel projection whose output terminates the model through a
+// purely element-wise activation: Parameter -> MatMul (N-split) -> Relu -> Result. With N=16
+// and 2 ranks each rank holds 8 output channels; rank 0 must expose the assembled full [1,16].
+std::shared_ptr<ov::Model> make_mlp_nsplit_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8});
+    std::vector<float> weights_data(8 * 16);
+    for (size_t i = 0; i < weights_data.size(); ++i) {
+        const float mag = 0.05f * static_cast<float>((i % 5) + 1);
+        weights_data[i] = (i % 2 == 0) ? mag : -mag;
+    }
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8, 16}, weights_data);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
+    auto relu = std::make_shared<ov::op::v0::Relu>(matmul);
+    auto result = std::make_shared<ov::op::v0::Result>(relu);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_mlp_nsplit");
+}
+
+// [S07] Same topology but with an output-channel count (15) not divisible by the number of
+// ranks: the pass must gracefully fall back to REPLICA (no slicing) instead of failing.
+std::shared_ptr<ov::Model> make_indivisible_projection_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8});
+    std::vector<float> weights_data(8 * 15);
+    for (size_t i = 0; i < weights_data.size(); ++i) {
+        weights_data[i] = 0.03f * static_cast<float>((i % 4) + 1);
+    }
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8, 15}, weights_data);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
+    auto result = std::make_shared<ov::op::v0::Result>(matmul);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_indivisible");
+}
+
+// Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
+std::vector<float> to_floats(const ov::Tensor& tensor) {
+    const auto count = tensor.get_size();
+    std::vector<float> out(count);
+    const auto et = tensor.get_element_type();
+    if (et == ov::element::f16) {
+        const auto* src = tensor.data<ov::float16>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(src[i]);
+        }
+    } else if (et == ov::element::bf16) {
+        const auto* src = tensor.data<ov::bfloat16>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = static_cast<float>(src[i]);
+        }
+    } else {
+        const auto* src = tensor.data<float>();
+        for (size_t i = 0; i < count; ++i) {
+            out[i] = src[i];
+        }
+    }
+    return out;
+}
+
+// Cosine similarity between two equally-sized tensors.
+double cosine_similarity(const ov::Tensor& a, const ov::Tensor& b) {
+    OPENVINO_ASSERT(a.get_size() == b.get_size(), "[TP] cosine_similarity size mismatch");
+    const auto va = to_floats(a);
+    const auto vb = to_floats(b);
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < va.size(); ++i) {
+        dot += static_cast<double>(va[i]) * vb[i];
+        na += static_cast<double>(va[i]) * va[i];
+        nb += static_cast<double>(vb[i]) * vb[i];
+    }
+    if (na == 0.0 || nb == 0.0) {
+        return (na == nb) ? 1.0 : 0.0;
+    }
+    return dot / (std::sqrt(na) * std::sqrt(nb));
 }
 
 // Number of individually addressable GPU devices (excludes sub-devices such as "GPU.0.0").
@@ -252,6 +334,100 @@ TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoSeams) {
     EXPECT_TRUE(seams.empty());
     auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
     EXPECT_TRUE(ranks.empty());
+}
+
+// [S07] GATE: N-split weight slicing + all-gather equivalent. Each rank holds only its
+// output-channel slice of the projection weights; rank 0 exposes the full [1,16] tensor
+// assembled from the per-rank slices. The result must match single-GPU inference.
+TEST_F(TensorParallelCompileGPU, NsplitMlpParityMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_mlp_nsplit_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) - 3.5f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(input);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    // The N-split seam is detected; rank-0 output is advertised at the full N shape.
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(input);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    // Shape contract: rank 0 must expose the FULL tensor, not its slice.
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    ASSERT_EQ(tp_output.get_shape(), (ov::Shape{1, 16}));
+
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999)
+        << "N-split all-gather output diverged from the single-GPU reference";
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S07] Negative: an output-channel count not divisible by the number of ranks must not fail
+// compilation - the pass degrades the seam to REPLICA (full weights on every rank) and the
+// replicated result still matches single-GPU inference.
+TEST_F(TensorParallelCompileGPU, NsplitNotDivisibleFallsBackToReplica) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_indivisible_projection_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) * 0.5f - 1.0f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(input);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::CompiledModel tp_compiled;
+    OV_ASSERT_NO_THROW(tp_compiled = core.compile_model(
+                          tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)}));
+
+    // Graceful fallback: the seam is reported as REPLICA (not sliced/assembled).
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("REPLICA:", 0), 0u) << "Unexpected seam: " << seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(input);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999);
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
 }
 
 }  // namespace

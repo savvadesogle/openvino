@@ -10,6 +10,8 @@
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/runtime/itt.hpp"
 #include "openvino/core/except.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/op/result.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "openvino/runtime/properties.hpp"
@@ -32,10 +34,53 @@ TPCompiledModel::TPCompiledModel(const std::shared_ptr<const ov::IPlugin>& plugi
     // thread. Build a dedicated executor so TP requests stay isolated from rank streams.
     set_task_executor(std::make_shared<ov::threading::CPUStreamsExecutor>(
         ov::threading::IStreamsExecutor::Config{"Intel GPU TP plugin executor"}));
+
+    build_output_ports();
+}
+
+// [S07] Ranks only materialize their N-slice of an N-split GEMM, so rank-0's native output
+// shape is the slice shape. For assembly outputs advertise the FULL shape (all-gather
+// equivalent); replicated outputs keep rank-0's native port as-is.
+void TPCompiledModel::build_output_ports() {
+    const auto& rank0_outputs = m_ranks.front()->outputs();
+    m_outputs.reserve(rank0_outputs.size());
+    for (size_t i = 0; i < rank0_outputs.size(); ++i) {
+        const auto& port = rank0_outputs[i];
+        const auto* seam = m_plan.find_output_seam(i);
+        if (seam == nullptr || seam->shard_dim_size <= 0 || seam->split_axis > -1) {
+            // Only last-axis N-split is supported at S07; otherwise expose the native port.
+            m_outputs.push_back(port);
+            continue;
+        }
+
+        auto partial_shape = port.get_partial_shape();
+        if (partial_shape.rank().is_static() && partial_shape.rank().get_length() >= 1) {
+            const int64_t rank = partial_shape.rank().get_length();
+            const size_t axis = static_cast<size_t>(rank - 1);
+            if (partial_shape[axis].is_static() && partial_shape[axis].get_length() == seam->shard_dim_size) {
+                // Already the full shape (e.g. graceful REPLICA fallback) - keep native port.
+                m_outputs.push_back(port);
+                continue;
+            }
+            if (partial_shape[axis].is_static()) {
+                auto full = partial_shape;
+                full[axis] = ov::Dimension(seam->shard_dim_size);
+                auto param = std::make_shared<ov::op::v0::Parameter>(port.get_element_type(), full);
+                param->set_friendly_name(port.get_node()->get_friendly_name() + "_tp_full");
+                auto result = std::make_shared<ov::op::v0::Result>(param);
+                result->set_friendly_name(port.get_node()->get_friendly_name());
+                m_synthetic_output_nodes.push_back(param);
+                m_synthetic_output_nodes.push_back(result);
+                m_outputs.emplace_back(std::static_pointer_cast<const ov::Node>(result), 0);
+                continue;
+            }
+        }
+        m_outputs.push_back(port);
+    }
 }
 
 const std::vector<ov::Output<const ov::Node>>& TPCompiledModel::outputs() const {
-    return m_ranks.front()->outputs();
+    return m_outputs;
 }
 
 const std::vector<ov::Output<const ov::Node>>& TPCompiledModel::inputs() const {

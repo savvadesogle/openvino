@@ -20,7 +20,7 @@
 - [x] S04 Stage1.1 TPCoordinator (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S05 Stage1.2 TPInferRequest (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S06 Stage2.1 TPShardTransform-скелет (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S07 Stage2.2 N-split + all-gather
+- [x] S07 Stage2.2 N-split + all-gather (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S08 Stage2.3 K-split + allreduce
 - [ ] S09 Stage2.4 int4_ASYM
 - [ ] S10 Stage3.1 per-rank KV
@@ -41,6 +41,8 @@
 | 2026-10-17 | S05 Stage1.2 TPInferRequest | **частично** (код+тест готовы) | Заглушка rank-0 заменена на `TPInferRequest` (`include/.../tp/tp_infer_request.hpp`, `src/.../tp/tp_infer_request.cpp`): k per-rank sub-запросов, репликация входов (общий host-тензор в `set_tensor` + memcpy rank0→rankN в `infer()` для lazy-буферов), выходы только rank0; `infer()` — последовательно по рангам (MVP). `TPCompiledModel::create_infer_request()` → `create_async_infer_request<>()` (обёртка `ov::IAsyncInferRequest` на выделенном `CPUStreamsExecutor`), `create_sync_infer_request()` → `TPInferRequest`. GATE-тест `TensorParallelInferMatchesSingleGpu` (паритет TP2 vs 1-GPU, доп. модель `make_tp_parity_model` с различными весами, SKIP <2 GPU). **GATE по сборке/прогону не подтверждён** — сабмодули по-прежнему пусты (см. S04/«Блокеры»)
 | 2026-10-17 | S06 Stage2.1 TPShardTransform | **частично** (код+тест готовы) | Добавлен identity/analysis OV-пасс `TPShardTransform` (`src/plugin/transformations/tp_shard_transform.{hpp,cpp}`): детектит `MatMul`/`FullyConnected`(`Compressed`), классифицирует (N_SPLIT/K_SPLIT/REPLICA) детерминированно, пишет `std::vector<TPSeam>` в `model->get_rt_info()` под ключом `intel_gpu_tp_seams`. Пасс регистрируется в `TransformationsPipeline::apply` **только при TP** (policy{TENSOR_PARALLEL} ИЛИ `enable_tensor_parallel`) — до фьюжнов/LowPrecision и семантически до `propagate_constants`. `TPPlan`/`TPSeamKind`/`TPCollectiveKind` расширены (`tp_plan.hpp` + новый `tp_plan.cpp`), `TPCoordinator::compile_model_tensor_parallel` собирает seams ранга-0 в план. Новое RO-свойство `ov::intel_gpu::tp_seams` (`vector<string>`, формат `KIND:COLLECTIVE:TYPE:NAME`) на `TPCompiledModel` и пустое на обычном/плагинном. Тесты S06 в `tensor_parallel.cpp` (детект+стабильность, K_SPLIT-классификация residual-проекции, TP-off регресс). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); identity подтверждается контрактом пасса (return false, только rt_info) |
 
+| 2026-10-17 | S07 Stage2.2 N-split + all-gather | **частично** (код+тест готовы) | **Rank в пасс — Вариант A**: новые internal-опции `ov::intel_gpu::tp_rank`/`tp_num_ranks` (`TP_RANK`/`TP_NUM_RANKS`, `OV_CONFIG_RELEASE_INTERNAL_OPTION`, default -1/1) в `internal_properties.hpp`+`options.inl`; `TPCoordinator::compile_model_tensor_parallel` штампует их в per-rank `ExecutionConfig` через `set_property` (прямое значение переживает `clone()`+`finalize()` в `clone_and_transform_model`); `TransformationsPipeline::apply` строит `TPShardTransform(config.get_tp_rank(), config.get_tp_num_ranks())`. **Срез**: пасс теперь при `rank>=0 && num_ranks>1` для каждого `N_SPLIT`-узла с константными весами заменяет Constant на слайс по N-оси (для `MatMul` — по `transpose_b`; `[K,n_r]`/`[N,n_r]`), режет bias (операнд 2) тем же диапазоном, заполняет `TPSeam.split_axis=-1`/`shard_dim_size=N`, возвращает `true`. Слайс — на OV-уровне, до фьюжнов и до `propagate_constants` (upload), на устройство едет только `[K, N/ranks]`. Sub-byte (int4) явно отклоняется (`int4 = S09`). **Fallback**: `N % num_ranks != 0` ИЛИ потребитель слайса не element-wise/Result → узел понижается до `REPLICA` (полные веса) — корректность сохраняется, жёсткого throw нет (задокументировано). **All-gather-эквивалент (host-side)**: `TPShardTransform` дополнительно строит `std::vector<TPOutputSeam>` (rt_info `intel_gpu_tp_output_seams`) — индексы model-output, достижимые из срезанного узла только через element-wise (Add/Mul/Relu/Gelu/…); `TPPlan.output_seams` собирается на ранге-0. `TPCompiledModel::build_output_ports()` публикует для таких выходов СИНТЕТИЧЕСКИЙ порт полной формы `[.., N]` (Parameter+Result, хранятся в объекте) — контракт S05 «выходы только rank-0» сохранён. `TPInferRequest` теперь владеет выходными host-тензорами (`m_output_tensors`), после `infer()` собирает полный выход конкатенацией регионов `[r*N/k,(r+1)*N/k]` (`copy_last_axis_region`, без арифметики), реплики копирует с rank-0. Тесты S07: `NsplitMlpParityMatchesSingleGpu` (MatMul[8,16]→Relu→Result, TP2 vs 1-GPU, cos>0.999, full shape [1,16]), `NsplitNotDivisibleFallsBackToReplica` (N=15 → REPLICA, паритет). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. S04/«Блокеры») |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -58,6 +60,45 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S07 done (частично, 2026-10-17)** — Stage 2.2 N-split + all-gather-эквивалент. Артефакты/решения:
+  - **Выбор механизма rank = Вариант A** (per-rank config): `ov::intel_gpu::tp_rank`/`tp_num_ranks`
+    (RELEASE_INTERNAL) в `include/intel_gpu/runtime/internal_properties.hpp` + `options.inl`;
+    `TPCoordinator` штампует `set_property(...)` в `RankContext::config` до `clone_and_transform_model`;
+    `TransformationsPipeline::apply` → `register_pass<TPShardTransform>(config.get_tp_rank(),
+    config.get_tp_num_ranks())`. Мотив: сохраняет позицию «до фьюжнов»; TP-off не затронут
+    (`tp_rank=-1`/`tp_num_ranks=1` → пасс не срезает). Прямая опция (не user-property) переживает
+    `config.clone()`+`finalize()` (finalize чистит только user-properties; значение опции копируется
+    конструктором копирования `ExecutionConfig`).
+  - **Срез**: `TPShardTransform::run_on_model` теперь меняет граф и возвращает `true`. Для `N_SPLIT`
+    с константными весами: `slice_constant` по N-оси (ось определяется `transpose_b` для
+    MatMul/FC, fallback — совпадение с последней dim выхода), `offset = rank*N/ranks`,
+    bias (input 2) — тем же диапазоном; `TPSeam.split_axis=-1`/`shard_dim_size=N`. НЕ режет K-ось,
+    не трогает `K_SPLIT`/`REPLICA`, не режет sub-byte (int4 → S09, явный throw в хелпере).
+  - **Деградация вместо throw** (задокументированный выбор негатива): невыполненные условия
+    (N % ranks != 0, динамический N/веса, небезопасный потребитель) → `seam.kind=REPLICA`, полные веса,
+    без сборки. Хелпер `slice_constant` при прямом неверном вызове бросает `OPENVINO_ASSERT`.
+  - **All-gather = host-конкатенация** (S07-компромисс): `TPOutputSeam{output_index,split_axis=-1,
+    shard_dim_size,producer}` (rt_info `intel_gpu_tp_output_seams` → `TPPlan.output_seams`);
+    `TPCompiledModel` публикует синтетический полный порт только для этих выходов;
+    `TPInferRequest::assemble_outputs()` конкатенирует регионы из per-rank выходов (без суммирования).
+    Device-side/коллективный транспорт — S08/S12.
+  - **ОГРАНИЧЕНИЕ S07 (важно для S08):** полная сборка корректна ТОЛЬКО когда срез-узел достигает
+    model-output через purely element-wise операции (или напрямую). Цепочка `N-split → (elementwise) →
+    другой GEMM` требует РЕАЛЬНОЙ all-gather между узлами (полный вход K для второго GEMM) — это вне
+    S07 (пасс понижает узел до REPLICA, если у него не-elementwise потребитель; при elementwise-цепочке
+    в следующий GEMM сработает shape-inference ошибка). Реальные Qwen qkv (reshape/rope/sdpa — не
+    elementwise) → пока компилируются как REPLICA.
+  - **Артефакты**: правки в `tp_shard_transform.{hpp,cpp}`, `tp_plan.{hpp,cpp}` (TPOutputSeam,
+    `find_output_seam`, rt_info-хелперы), `tp_coordinator.cpp`, `tp_compiled_model.{hpp,cpp}`,
+    `tp_infer_request.{hpp,cpp}`, `transformations_pipeline.cpp`, `internal_properties.hpp`, `options.inl`;
+    тесты в `tensor_parallel.cpp`.
+  - **Заметка S07→S08:** S08 = K-split + allreduce(summ, fp32-acc) + швы-события. Точки:
+    `TPSeam.kind==K_SPLIT` (уже классифицируется как residual-проекция) — веса резать по K-оси (для
+    `MatMul` `transpose_b=false` веса `[K,N]` → срез по axis 0; для int4 K кратно group_size=128),
+    bias НЕ резать (добавляется один раз в reducer), `TPCollectiveKind::ALL_REDUCE_SUM`. Сейчас K_SPLIT
+    узлы копируются целиком на каждом ранге (REPLICA-эквивалент) — S08 впервые срежет их и введёт
+    суммирование частичных результатов (host-side на S08 достаточно, device-side — S12). GATE — паритет
+    на тесте с residual-проекцией.
 - **S06 done (частично, 2026-10-17)** — Stage 2.1 TPShardTransform-скелет. Артефакты:
   - Новый OV-пасс `TPShardTransform` (`src/plugins/intel_gpu/src/plugin/transformations/tp_shard_transform.hpp`,
     `.cpp`): `ov::pass::ModelPass`, `run_on_model` возвращает **false** (identity — граф не меняется).
