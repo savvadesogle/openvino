@@ -1,6 +1,6 @@
-# Qwen3.5-9B-int4 state inventory (S10)
+# Qwen3.5-9B-int4 state inventory (S10 + S11)
 
-Конспект S10. Проверено на `models/Qwen3.5-9B-int4-ov/openvino_language_model.xml`
+Конспект S10/S11. Проверено на `models/Qwen3.5-9B-int4-ov/openvino_language_model.xml`
 (IR version 11, tip upstream 85720fe2). Только чтение; `.bin` не коммитится.
 
 ## 1. Как представлен state в графе
@@ -83,3 +83,37 @@ state-оптимизаций; на его входе state — «сырые» `R
   `validate_nodes_and_infer_types()`.
 - `Assign` — `Sink` (нет output-потребителей): его вход должен быть достижим из
   `ReadValue` той же переменной (чистая рекуррентность) для head-среза.
+
+## 6. S11: linear-attention per-head state sharding
+
+Точные цепочки (проверено по XML, layer N линейного внимания):
+
+- **conv-цепочка** (тайл `conv.N`, state `?,8192,4`):
+  `ReadValue(conv.N)[b,8192,4]` → `Gather(axis=0, beam)` → `Concat(axis=2, вход
+  [b,8192,-1])` → `GroupConvolution` (depthwise: filters `[8192,1,1,4]`) →
+  `Slice(axis=2)` → `Assign`. Все op, кроме `GroupConvolution`, — не element-wise.
+  Head-ось = **axis 1** (каналы = 32 головы × 256).
+- **ssm-цепочка** (тайл `ssm.N`, state `?,32,128,128`):
+  `ReadValue(ssm.N)` → `Gather(axis=0, beam)` → `Loop(Loop_1502, delta-rule, внутри
+  ScatterNDUpdate)` → `Reshape` → `Assign`. `Loop` непрозрачен. Head-ось = **axis 1**
+  (32 la-головы; оси 2,3 — key/value 128×128).
+- **conv-веса** — int4_ASYM dequant (не «голый» `Constant`):
+  `Const u4 [8192,1,1,4] → Convert → Subtract(zp) → Multiply(scale) → Convert`.
+  Учесть при будущем срезе весов (S12).
+
+**Вывод:** реальные Qwen-цепочки **не head-local** (coupled fused `in_proj` +
+`Concat` с полновесным входом + `Loop`/`ScatterNDUpdate` + weight-coupling) →
+остаются **REPLICATED** (согласуется с S10). Per-rank Qwen требует S12
+(device-side коллективы/события).
+
+**Реализовано в S11** (`TPShardTransform`) для head-local состояния: примитив
+PLAN §4.3 «depthwise conv per head». Если вся цепочка `ReadValue →
+depthwise GroupConvolution → (elementwise/broadcast) → Assign` head-local
+(filters — `Constant` формы `[GROUPS,1,1,k]` c `GROUPS == data channels ==
+head_dim_full`, конв-канал — head-ось), переменная переводится в `HEAD_SHARDED`
+по канало-оси, а **depthwise-фильтры режутся тем же ранговым диапазоном**
+(ось 0, `slice_constant`). Ось головы выбирается с приоритетом **axis 1**
+(канонический layout Qwen: `[batch, heads, ...]`), затем `rank-2`, затем первая
+делимая внутренняя ось. Любой иной (не-depthwise / не-head-local) `GroupConvolution`
+в цепочке → `REPLICATED` без throw. Тест: `make_linear_attn_conv_state_model`
+(heads=4 → HEAD_SHARDED, heads=3 → REPLICATED).

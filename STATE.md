@@ -24,7 +24,7 @@
 - [x] S08 Stage2.3 K-split + allreduce (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S09 Stage2.4 int4_ASYM (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S10 Stage3.1 per-rank KV + state aggregation (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S11 Stage3.2 linear_attention
+- [x] S11 Stage3.2 linear_attention (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S12 Stage3.3 Hard (dynamic/events/concurrency)
 - [ ] S13 Stage4.1 GenAI интеграция
 - [ ] S14 Stage4.2 Scheduler + бенч
@@ -49,6 +49,8 @@
 
 | 2026-10-17 | S10 Stage3.1 per-rank KV + state aggregation | **частично** (код+тест готовы) | **Инвентаризация состояний Qwen** (`docs/notes/state-inventory.md`): 64 `ReadValue`/`Assign` (opset6), 0 Stateful; 8 `ScaledDotProductAttention` (full attn) и 24 `Loop`+`ScatterUpdate`+`GroupConvolution` (linear attn). Переменные (f32, dynamic): `past.key.N`/`past.value.N` `?,4,?,256` (KV-head ось = 1, kv-heads=4, head_dim=256), `past.conv.N` `?,8192,4`, `past.ssm.N` `?,32,128,128`. **Ключевой вывод**: реальные Qwen KV/conv/ssm-цепочки не head-local (SDPA/Loop/Concat/GroupConvolution — не element-wise) → head-slice небезопасен, поэтому они остаются **REPLICATED** (rank-0 авторитетный); per-rank KV для Qwen требует inter-node коллективов = S12. **Классификация/шардинг состояний**: `TPShardTransform` после GEMM-прохода собирает переменные (`ReadValueBase`/`AssignBase` по `variable_id`), анализирует `analyze_state_variable`: статическая форма, числовой тип, делимая head-ось (`find_state_head_axis`: предпочтительна ось `rank-2`, иначе первая делимая в `1..rank-2`), цепочка `ReadValue -> (element-wise/broadcast) -> Assign` целиком head-local (все не-цепные операнды broadcast'ятся по head-оси: dim==1 или rank≤axis; init_value ReadValue тоже должен broadcast'иться), иначе `REPLICATED` с диагностической причиной (без throw). При успехе — `var->update_data_shape(sliced)` + `model->validate_nodes_and_infer_types()` (per-pass validation выключен в `transformations_pipeline.cpp:645`). **Структура/транспорт**: `TPStateSeam{variable_id, TPStateShardKind(REPLICATED/HEAD_SHARDED), axis, full_dim, full_shape, reason}` в `TPPlan.state_seams`; rt_info `intel_gpu_tp_state_seams`; RO-property `ov::intel_gpu::tp_state_seams` на `TPCompiledModel` (формат `KIND:AXIS:FULL_DIM:VARIABLE_ID`, напр. `HEAD_SHARDED:1:4:tp_state_var`) и пустое на обычном/плагинном. **Агрегация**: `TPInferRequest::query_state()` строит `TPAggregatedState : ov::IVariableState` по каждому состоянию (совпадение по имени = variable_id): `get_state()` конкатенирует head-оси рангов для HEAD_SHARDED, rank-0 для REPLICATED; `set_state()` скаттерит полный тензор по рангам (`extract_axis_region`) или fan-out; `reset()` — по всем рангам. **Обобщение осей**: `copy_last_axis_region` заменён generic `copy_axis_region`/`extract_axis_region`; `build_output_ports`/`assemble_outputs` собирают all-gather по произвольной оси (для N-split ось по-прежнему последняя); выходы, производные от HEAD_SHARDED-состояния, получают отдельный ALL_GATHER-шов. Тесты: `StateHeadShardingMatchesSingleGpu` (head-local mini-модель, TP2 vs 1-GPU по 5 шагам + проверка шва `HEAD_SHARDED:1:4:` и полной формы агрегированного состояния), `StateNonBroadcastOperandStaysReplicated` (full-width операнд → `REPLICATED:`, паритет), `DefaultCompileHasNoStateSeams`. **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); реальный Qwen state — REPLICATED (обосновано) |
 
+| 2026-10-17 | S11 Stage3.2 linear_attention | **частично** (код+тест готовы) | **Примитив PLAN §4.3 «depthwise conv per head»**. `TPShardTransform` теперь распознаёт head-local состоятельную цепочку, рекуррентность которой идёт через **depthwise `GroupConvolution`** (`ReadValue -> depthwise GroupConvolution -> (elementwise/broadcast) -> Assign`): depthwise ⇔ filters `[GROUPS,1,1,k]` c `GROUPS == data channels == full_dim` (`match_depthwise_head_conv`, filters — `Constant`); переменная переводится в `HEAD_SHARDED` по канало-оси, а **depthwise-фильтры режутся тем же ранговым диапазоном** (ось 0, `slice_constant`, `replace_constant`) до `validate_nodes_and_infer_types()`. **Ось головы**: `find_state_head_axis` теперь предпочитает **axis 1** (каноничный layout Qwen `[batch, heads, ...]` — KV/conv/ssm), затем `rank-2`, затем первую делимую внутреннюю ось (для старых тестов `[1,4,2]` результат тот же). Любой иной (не-depthwise / не-head-local) `GroupConvolution` в цепочке → `REPLICATED` без throw (прогресс S07–S10). **Инвентарь**: `docs/notes/state-inventory.md` §6 — точные conv-цепочки (`Gather → Concat → GroupConvolution → Slice`), ssm (`Gather → Loop(delta-rule) → Reshape`), head-ось = 1, conv-веса тоже int4_ASYM dequant. **Вывод**: реальные Qwen-цепочки не head-local (coupled fused `in_proj` + `Concat`/`Loop`/`ScatterNDUpdate`) → **REPLICATED**; per-rank Qwen = S12. **Тесты**: `LinearAttentionConvStateHeadShardingMatchesSingleGpu` (heads=4 → `HEAD_SHARDED:1:4:`, multi-step паритет, агрегированное состояние полной формы) и `LinearAttentionConvStateIndivisibleStaysReplicated` (heads=3 → `REPLICATED:`), модель `make_linear_attn_conv_state_model` (depthwise conv same-pad). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -58,7 +60,7 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
-  Актуально для S05, S06, S07, S08, S09 и S10: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
+  Актуально для S05, S06, S07, S08, S09, S10 и S11: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
   тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
@@ -67,6 +69,31 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S11 done (частично, 2026-10-17)** — Stage 3.2 linear_attention. Артефакты/решения:
+  - **Примитив «depthwise conv per head» (PLAN §4.3)**: `TPShardTransform::analyze_state_variable` теперь
+    обрабатывает `ov::op::v1::GroupConvolution` в цепочке состояния. Распознаётся только **depthwise-форма**
+    (`match_depthwise_head_conv`: filters — `Constant` формы `[GROUPS,1,1,k]`, `GROUPS == data channels ==
+    full_dim`, данные-операнд на head-оси); при совпадении фильтры режутся по оси 0 тем же ранговым
+    диапазоном (`slice_constant`+`replace_constant`, суффикс `_tp_headrank`), затем шардится переменная и
+    вызывается `validate_nodes_and_infer_types()`. Не-depthwise/`GroupConvolution`-без-Constant-filters →
+    цепочка `REPLICATED` (без throw). Второй проход BFS пропускает input 1 (filters) конва как исключение.
+  - **Head-ось**: `find_state_head_axis` предпочитает **axis 1** (`[batch, heads, ...]` — KV/conv/ssm Qwen),
+    затем `rank-2`, затем первую делимую внутреннюю. Старые S10-тесты (`[1,4,2]`) не затронуты (axis 1).
+  - **Инвентарь linear-attention** — `docs/notes/state-inventory.md` §6: conv-цепочка `ReadValue[b,8192,4] →
+    Gather(axis0) → Concat(axis2) → GroupConvolution(filters[8192,1,1,4]) → Slice → Assign`; ssm `ReadValue[b,32,128,128] →
+    Gather → Loop(Loop_1502, delta-rule, ScatterNDUpdate) → Reshape → Assign`; head-ось = 1; **conv-веса тоже
+    int4_ASYM dequant** (`Const u4 → Convert → Subtract → Multiply → Convert`, не голый Constant). Вывод:
+    реальные Qwen-цепочки не head-local → REPLICATED; per-rank Qwen = S12.
+  - **Тесты** (`tensor_parallel.cpp`): билдер `make_linear_attn_conv_state_model(heads,taps)` (Variable
+    `[1,heads,taps]` → ReadValue → depthwise GroupConvolution same-pad → Assign + Result);
+    `LinearAttentionConvStateHeadShardingMatchesSingleGpu` (heads=4: seam `HEAD_SHARDED:1:4:`, 4-шаговый
+    паритет, агрегированное состояние `[1,4,taps]`); `LinearAttentionConvStateIndivisibleStaysReplicated`
+    (heads=3: seam `REPLICATED:`). Шапка-комментарий теста дополнена S10/S11.
+  - **Сборка по-прежнему недоступна** (сабмодули пусты) → GATE частичный (код + план теста). Перед S12:
+    ревью и, при появлении сабмодулей, прогон `tensor_parallel`.
+  - **S12 стартует с**: Stage3.3 Hard — динамические шейпы состояний (`?,4,?,256` и т.п.), device-side
+    коллективы/события, concurrency. Реальные Qwen-состояния станут per-rank только когда появятся межранговые
+    коллективы и разрезка coupled fused `in_proj`/`Concat`/`Loop` (см. §6 инвентаря).
 - **S10 done (частично, 2026-10-17)** — Stage 3.1 per-rank KV + state aggregation. Артефакты/решения:
   - **Реальный Qwen → все состояния REPLICATED.** KV (`ScaledDotProductAttention`), conv (`GroupConvolution`)
     и ssm (`Loop`) — не element-wise потребители, head-slice небезопасен; per-rank KV для Qwen невозможен

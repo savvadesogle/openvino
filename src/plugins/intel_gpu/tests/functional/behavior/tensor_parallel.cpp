@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05/S07/S08/S09] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08/S09/S10/S11] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -20,7 +20,15 @@
 //      Reshape -> Convert) and slices weight + scale + zero_point on group boundaries (N-split:
 //      whole out-channel chunks; K-split: whole groups, K multiple of group_size * num_ranks).
 //      Indivisible/unsliceable cases fall back to REPLICA.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04, S05, S06, S07, S08, S09).
+// S10: stateful recurrent state - TPShardTransform head-shards a head-local state variable
+//      (ReadValue -> element-wise -> Assign) along the head axis, splitting it per rank and
+//      aggregating it back to the full head shape on query_state(); non-head-local state stays
+//      replicated (rank 0 authoritative). SDPA/GQA KV cache is head-sharded.
+// S11: linear attention - a head-local state whose recurrence runs through a depthwise
+//      GroupConvolution is head-sharded along the channel (head) axis with the depthwise filters
+//      sliced per rank; chains that mix heads (real Qwen conv/ssm chains via Concat/Loop) stay
+//      replicated.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S11).
 
 #include <algorithm>
 #include <cmath>
@@ -39,6 +47,7 @@
 #include "openvino/op/assign.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
+#include "openvino/op/group_conv.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
@@ -258,6 +267,43 @@ std::shared_ptr<ov::Model> make_stateful_head_model(size_t heads, size_t head_di
                                        ov::SinkVector{assign},
                                        ov::ParameterVector{x},
                                        "tp_state_head");
+}
+
+// [S11] A minimal linear-attention-like block: a per-head state updated through a depthwise
+// GroupConvolution (the PLAN §4.3 "depthwise conv per head" primitive). The variable holds
+// [1, heads, taps]; ReadValue -> depthwise GroupConvolution (per-channel kernel, same padding so
+// the output keeps [1, heads, taps]) -> Assign. Every output channel depends only on the matching
+// input channel, so the chain is head-local: the pass must head-shard the variable along the head
+// axis (axis 1) and slice the depthwise filters (GROUPS = heads) by the same rank range.
+std::shared_ptr<ov::Model> make_linear_attn_conv_state_model(size_t heads, size_t taps) {
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{1, static_cast<int64_t>(heads), static_cast<int64_t>(taps)},
+                                   ov::element::f32,
+                                   "tp_la_conv_state"});
+    auto read_value = std::make_shared<ov::op::v6::ReadValue>(variable);
+    // Depthwise filters [GROUPS=heads, C_OUT/GROUPS=1, C_IN/GROUPS=1, k=taps].
+    std::vector<float> filter_data(heads * taps);
+    for (size_t i = 0; i < filter_data.size(); ++i) {
+        filter_data[i] = 0.2f * static_cast<float>((i % 5) + 1) - 0.5f;
+    }
+    auto filters = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{heads, 1, 1, taps}, filter_data);
+    const ov::Strides strides{1};
+    const ov::CoordinateDiff pads_begin{static_cast<std::ptrdiff_t>(taps / 2)};
+    const ov::CoordinateDiff pads_end{static_cast<std::ptrdiff_t>(taps - 1 - taps / 2)};
+    const ov::Strides dilations{1};
+    auto conv = std::make_shared<ov::op::v1::GroupConvolution>(read_value,
+                                                               filters,
+                                                               strides,
+                                                               pads_begin,
+                                                               pads_end,
+                                                               dilations,
+                                                               ov::op::PadType::EXPLICIT);
+    auto assign = std::make_shared<ov::op::v6::Assign>(conv, variable);
+    auto result = std::make_shared<ov::op::v0::Result>(conv);
+    return std::make_shared<ov::Model>(ov::ResultVector{result},
+                                       ov::SinkVector{assign},
+                                       ov::ParameterVector{},
+                                       "tp_la_conv_state");
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -975,6 +1021,115 @@ TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoStateSeams) {
     auto compiled = core.compile_model(plain_model, ov::test::utils::DEVICE_GPU);
     auto state_seams = compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
     EXPECT_TRUE(state_seams.empty());
+}
+
+// [S11] GATE: a head-local linear-attention state whose recurrence runs through a depthwise
+// GroupConvolution must be head-sharded (axis 1 = heads) with the depthwise filters sliced per
+// rank. Multi-step TP inference must match single-GPU over the recurrence and the aggregated
+// state must expose the full head shape on query_state().
+TEST_F(TensorParallelCompileGPU, LinearAttentionConvStateHeadShardingMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t taps = 3;
+    auto ref_model = make_linear_attn_conv_state_model(heads, taps);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    // "HEAD_SHARDED:<axis>:<full_dim>:<variable_id>" -> axis 1, full_dim 4.
+    EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+    EXPECT_NE(state_seams[0].find(":1:4:"), std::string::npos) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    // Seed a non-zero, per-head-distinct initial state so the conv recurrence is actually
+    // exercised and the rank<->head scatter is checked (HEAD_SHARDED path).
+    ov::Tensor init_state(ov::element::f32, ov::Shape{1, heads, taps});
+    auto* init_data = init_state.data<float>();
+    for (size_t i = 0; i < heads * taps; ++i) {
+        init_data[i] = 0.25f * static_cast<float>(i + 1) - 0.5f;
+    }
+    ref_request.query_state()[0].set_state(init_state);
+    tp_request.query_state()[0].set_state(init_state);
+
+    const size_t steps = 4;
+    for (size_t t = 0; t < steps; ++t) {
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    // The aggregated TP state must expose the FULL head shape (not the per-rank slice).
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    const ov::Tensor tp_state = tp_states[0].get_state();
+    EXPECT_EQ(tp_state.get_shape(), (ov::Shape{1, heads, taps}));
+    auto ref_states = ref_request.query_state();
+    ASSERT_EQ(ref_states.size(), 1u);
+    ASSERT_EQ(ref_states[0].get_state().get_shape(), tp_state.get_shape());
+    ov::test::utils::compare(ref_states[0].get_state(), tp_state, 1e-4f, 1e-4f);
+}
+
+// [S11] Negative: a head count not divisible by the number of ranks makes the depthwise conv state
+// non-head-local, so the variable must stay REPLICATED (no filter slicing, rank 0 authoritative)
+// and TP inference must still match single-GPU over the recurrence.
+TEST_F(TensorParallelCompileGPU, LinearAttentionConvStateIndivisibleStaysReplicated) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 3;  // not divisible by 2 ranks
+    const size_t taps = 3;
+    auto ref_model = make_linear_attn_conv_state_model(heads, taps);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    // A non-zero initial state (rank-0 fan-out path for REPLICATED) is set on both requests.
+    ov::Tensor init_state(ov::element::f32, ov::Shape{1, heads, taps});
+    auto* init_data = init_state.data<float>();
+    for (size_t i = 0; i < heads * taps; ++i) {
+        init_data[i] = 0.25f * static_cast<float>(i + 1) - 0.5f;
+    }
+    ref_request.query_state()[0].set_state(init_state);
+    tp_request.query_state()[0].set_state(init_state);
+
+    for (size_t t = 0; t < 3; ++t) {
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    EXPECT_EQ(tp_states[0].get_state().get_shape(), (ov::Shape{1, heads, taps}));
 }
 
 }  // namespace

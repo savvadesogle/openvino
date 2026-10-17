@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S06/S07] Experimental GPU tensor-parallel support.
+// [TP-GPU, S06/S07/S08/S09/S10/S11] Experimental GPU tensor-parallel support.
 // TPShardTransform detects MatMul/FullyConnected candidates for tensor-parallel sharding
 // and classifies each one (N-split / K-split / replica), recording the result in the model
 // rt_info for the TPCoordinator to pick up.
@@ -19,6 +19,10 @@
 // head-sharded (variable shape reduced along the head axis per rank) and recorded in
 // ov::intel_gpu::tp_state_seams_rt_info_key() so TPInferRequest can aggregate them; all other
 // variables (dynamic shapes, non-element-wise chains) stay replicated.
+// S11 recognises the PLAN §4.3 "depthwise conv per head" primitive: a head-local state chain
+// that runs through a depthwise GroupConvolution (constant filters [GROUPS,1,1,k], GROUPS ==
+// data channels) is head-sharded along the channel/head axis and the depthwise filters are
+// sliced by the same rank range. Chains that mix heads stay replicated.
 // See PLAN.md §4.2, §4.3, §7.4.
 
 #pragma once

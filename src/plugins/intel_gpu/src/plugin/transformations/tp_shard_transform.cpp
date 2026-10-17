@@ -26,6 +26,13 @@
 //    scatters on set_state()). Everything else (dynamic shapes, non-head-local chains - e.g. the
 //    Qwen3.5 SDPA KV cache and the linear-attention conv/ssm states) stays REPLICATED (rank 0
 //    authoritative). See docs/notes/state-inventory.md and PLAN §4.3/§5 (S10).
+//  - S11: linear attention. A head-local state chain whose recurrence runs through a depthwise
+//    GroupConvolution (PLAN §4.3 "depthwise conv per head") is now recognized: the variable is
+//    head-sharded along the channel (head) axis and the depthwise conv filters are sliced by the
+//    same rank range before validation. The head axis preference follows the Qwen3.5 layout
+//    (axis 1 = heads for KV, conv channels and the ssm state). Chains that mix heads (the real
+//    Qwen conv/ssm chains go through Concat/Loop with full-width coupled projections) stay
+//    REPLICATED. See PLAN §4.3/§5 (S11).
 // See PLAN.md §2, §4.2, §4.3, §7.4.
 
 #include "tp_shard_transform.hpp"
@@ -60,6 +67,7 @@
 #include "openvino/op/erf.hpp"
 #include "openvino/op/exp.hpp"
 #include "openvino/op/gelu.hpp"
+#include "openvino/op/group_conv.hpp"
 #include "openvino/op/log.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
@@ -864,9 +872,13 @@ bool apply_ksplit_quantized(const QuantizedWeight& qw, int64_t offset_g, int64_t
 // [S10] State (ReadValue/Assign) head-sharding analysis. See docs/notes/state-inventory.md.
 // ---------------------------------------------------------------------------------------------
 
-//! Preferred head axis of a state tensor: the axis adjacent to the innermost one (per-head layout
-//! [.., H, hd], e.g. the KV cache [batch, kv_heads, seq, head_dim]); falls back to the first
-//! divisible interior axis. Returns -1 when no divisible interior axis exists.
+//! Preferred head axis of a state tensor. Qwen3.5 keeps the heads at axis 1 of every state
+//! ([batch, heads, ...]): the full-attention KV cache ([batch, kv_heads, seq, head_dim]), the
+//! linear-attention depthwise conv state ([batch, channels, kernel] with channels = heads * d)
+//! and the delta-rule ssm state ([batch, heads, key, value]). Axis 1 is therefore preferred when
+//! it is a divisible interior axis; otherwise the axis adjacent to the innermost one (per-head
+//! [.., H, hd]) and finally the first divisible interior axis. Returns -1 when no divisible
+//! interior axis exists. See docs/notes/state-inventory.md.
 int64_t find_state_head_axis(const ov::Shape& shape, int32_t num_ranks) {
     const int64_t rank = static_cast<int64_t>(shape.size());
     if (rank < 2 || num_ranks <= 1) {
@@ -875,6 +887,9 @@ int64_t find_state_head_axis(const ov::Shape& shape, int32_t num_ranks) {
     auto divisible = [&](int64_t a) {
         return a >= 1 && a <= rank - 2 && shape[a] > 1 && (shape[a] % static_cast<size_t>(num_ranks) == 0);
     };
+    if (divisible(1)) {
+        return 1;
+    }
     const int64_t preferred = rank - 2;
     if (divisible(preferred)) {
         return preferred;
@@ -885,6 +900,49 @@ int64_t find_state_head_axis(const ov::Shape& shape, int32_t num_ranks) {
         }
     }
     return -1;
+}
+
+//! A depthwise GroupConvolution weight that must be sliced along the head axis together with a
+//! head-sharded state variable. This realizes the PLAN §4.3 "depthwise conv per head" primitive:
+//! each output channel depends only on the matching input channel, so slicing the filters by whole
+//! groups keeps the per-head recurrence valid.
+struct HeadConvWeight {
+    std::shared_ptr<ov::Node> conv;                 //!< the GroupConvolution node
+    std::shared_ptr<ov::op::v0::Constant> weight;   //!< constant filters [GROUPS, 1, 1, k...]
+    int64_t axis = 0;                               //!< filters axis carrying the head/group dim
+    int64_t full_dim = -1;                          //!< full channel (= head) count
+};
+
+//! Recognizes a depthwise GroupConvolution (filters [C, 1, 1, k...], i.e. C_OUT/GROUPS == 1 and
+//! C_IN/GROUPS == 1, so GROUPS == data channels) whose data channel axis is @p head_axis (== 1)
+//! and whose channel count equals @p full_dim. Returns false for anything but a purely per-channel
+//! convolution with a constant kernel (so a wrong slice can never be produced).
+bool match_depthwise_head_conv(const std::shared_ptr<ov::Node>& node,
+                               int64_t head_axis,
+                               int64_t full_dim,
+                               HeadConvWeight& out) {
+    auto gc = ov::as_type_ptr<ov::op::v1::GroupConvolution>(node);
+    if (!gc || head_axis != 1 || full_dim <= 0 || gc->get_input_size() < 2) {
+        return false;
+    }
+    auto weight = ov::as_type_ptr<ov::op::v0::Constant>(gc->input_value(1).get_node_shared_ptr());
+    if (!weight) {
+        return false;
+    }
+    const auto fshape = weight->get_shape();
+    // OV filters layout: [GROUPS, C_OUT/GROUPS, C_IN/GROUPS, k...]. Depthwise == the two group
+    // splits are 1, hence GROUPS == data channels == output channels == filters[0].
+    if (fshape.size() < 3 || fshape[1] != 1 || fshape[2] != 1) {
+        return false;
+    }
+    if (static_cast<int64_t>(fshape[0]) != full_dim) {
+        return false;
+    }
+    out.conv = node;
+    out.weight = weight;
+    out.axis = 0;
+    out.full_dim = full_dim;
+    return true;
 }
 
 //! True when an operand of an element-wise node may keep its shape when the state head axis is
@@ -908,6 +966,9 @@ struct StateShardAnalysis {
     int64_t full_dim = -1;
     ov::Shape full_shape;
     std::vector<size_t> derived_results;  // model output indices reachable via element-wise ops
+    //! [S11] depthwise conv weights reachable from the state chain that must be sliced per rank
+    //! (the "depthwise conv per head" primitive, PLAN §4.3).
+    std::vector<HeadConvWeight> conv_weights;
     std::string reason;
 };
 
@@ -960,7 +1021,7 @@ StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Va
     const std::string target_id = info.variable_id;
     std::unordered_set<const ov::Node*> reachable;
     std::vector<std::shared_ptr<ov::Node>> work;
-    std::vector<std::shared_ptr<ov::Node>> elementwise_nodes;
+    std::vector<std::shared_ptr<ov::Node>> chain_nodes;
     for (const auto& rv : read_values) {
         reachable.insert(rv.get());
         work.push_back(rv);
@@ -987,22 +1048,45 @@ StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Va
                     covered_assigns.insert(consumer.get());
                     continue;
                 }
+                // [S11] A depthwise GroupConvolution whose channel axis is the head axis is
+                // head-local (each output channel depends only on the matching input channel):
+                // the "depthwise conv per head" primitive of PLAN §4.3. Its constant filters are
+                // sliced together with the variable so the per-rank shape stays consistent.
+                if (ov::is_type<ov::op::v1::GroupConvolution>(consumer)) {
+                    HeadConvWeight cw;
+                    if (!match_depthwise_head_conv(consumer, a.axis, a.full_dim, cw)) {
+                        a.reason = "non-head-local GroupConvolution in state chain";
+                        return a;
+                    }
+                    a.conv_weights.push_back(cw);
+                    if (reachable.insert(consumer.get()).second) {
+                        work.push_back(consumer);
+                        chain_nodes.push_back(consumer);
+                    }
+                    continue;
+                }
                 if (!is_elementwise(consumer)) {
                     a.reason = "non-element-wise state consumer";
                     return a;
                 }
                 if (reachable.insert(consumer.get()).second) {
                     work.push_back(consumer);
-                    elementwise_nodes.push_back(consumer);
+                    chain_nodes.push_back(consumer);
                 }
             }
         }
     }
-    // Second pass: every operand of every reached element-wise node must be a matching ReadValue,
-    // another reached node, or broadcast along the head axis.
-    for (const auto& n : elementwise_nodes) {
-        for (const auto& iv : n->input_values()) {
-            auto producer = iv.get_node_shared_ptr();
+    // Second pass: every operand of every reached chain node must be a matching ReadValue, another
+    // reached node, or broadcast along the head axis (depthwise conv filters are the companion
+    // constant sliced with the state, so they are exempt).
+    for (const auto& n : chain_nodes) {
+        const bool is_conv = ov::is_type<ov::op::v1::GroupConvolution>(n);
+        const auto& inputs = n->input_values();
+        for (size_t ii = 0; ii < inputs.size(); ++ii) {
+            if (is_conv && ii == 1) {
+                continue;  // depthwise filters (constant, sliced with the variable)
+            }
+            auto producer = inputs[ii].get_node_shared_ptr();
             if (ov::is_type<ov::op::util::ReadValueBase>(producer)) {
                 if (state_variable_id(producer) != target_id) {
                     a.reason = "state chain mixes variables";
@@ -1013,7 +1097,7 @@ StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Va
             if (reachable.count(producer.get())) {
                 continue;
             }
-            if (!operand_broadcasts_at_axis(producer->get_output_partial_shape(iv.get_index()), a.axis)) {
+            if (!operand_broadcasts_at_axis(producer->get_output_partial_shape(inputs[ii].get_index()), a.axis)) {
                 a.reason = "non-broadcast operand on head axis";
                 return a;
             }
@@ -1345,7 +1429,20 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
             ss.axis = analysis.axis;
             ss.full_dim = analysis.full_dim;
             ss.full_shape = analysis.full_shape;
-            ss.reason = "head-local element-wise state chain";
+            ss.reason = analysis.conv_weights.empty() ? "head-local element-wise state chain"
+                                                      : "head-local depthwise conv state chain";
+            const int64_t count = analysis.full_dim / m_num_ranks;
+            const int64_t offset = static_cast<int64_t>(m_rank) * count;
+            // [S11] Slice the companion depthwise conv filters so each rank owns the matching
+            // channel/group range before the (sharded) variable shape is validated.
+            for (const auto& cw : analysis.conv_weights) {
+                auto sliced = slice_constant(cw.weight, cw.axis, offset, count);
+                replace_constant(cw.weight, sliced, "_tp_headrank");
+                GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform state " << id
+                               << ": sliced depthwise conv filters of "
+                               << cw.conv->get_friendly_name() << " [" << offset << ", " << offset + count << ")"
+                               << std::endl;
+            }
             auto sharded = analysis.full_shape;
             sharded[analysis.axis] = sharded[analysis.axis] / static_cast<size_t>(m_num_ranks);
             g.var->update_data_shape(ov::PartialShape(sharded));
