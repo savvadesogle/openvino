@@ -12,8 +12,9 @@
   блокере — нормальный результат; зафиксируй его в STATE.md.
 
 ## Контекст, который УЖЕ исполнен (не повторять)
-- S01 done: ветка feature/gpu-tensor-parallel создана от master (tip 24e336ca) и
-  запушена в origin; 4 конспекта в docs/notes/; commit "S01: project init notes + S02 prompt".
+- S01 done: ветка feature/gpu-tensor-parallel создана от master (tip 24e336ca);
+  4 конспекта в docs/notes/; commits 7bd6c6d4 + d0d2a20c. Если ветки ещё нет в
+  origin — push был заблокирован 403, см. STATE «Блокеры» (нужен gh auth login).
 - Тест-модель локально: C:\openvino-tp\models\Qwen3.5-9B-int4-ov (в этой сессии не нужна).
 - Железо: Windows-машина с 2+ discrete Intel GPU (Arc/Battlemage), PCIe.
 
