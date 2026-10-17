@@ -19,7 +19,7 @@
 - [x] S03 L0-спайк B (G0) (2026-10-17): tools/l0_spike/l0_bench.py (+ output); bw/latency-таблицы — docs/notes/l0-spike.md §8; **G0 = host-USM staging** (журнал гейтов)
 - [x] S04 Stage1.1 TPCoordinator (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S05 Stage1.2 TPInferRequest (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S06 Stage2.1 TPShardTransform-скелет
+- [x] S06 Stage2.1 TPShardTransform-скелет (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S07 Stage2.2 N-split + all-gather
 - [ ] S08 Stage2.3 K-split + allreduce
 - [ ] S09 Stage2.4 int4_ASYM
@@ -39,6 +39,7 @@
 | 2026-10-17 | **S03 L0-спайк B → G0** | **G0 = host-USM staging** | Микробенч (docs/notes/l0-spike.md §8): единственный рабочий междевайсный путь — dev_i→pinned host→dev_j; ~7–10 GB/s/плечо, ~4–5 GB/s end-to-end (16–128 MB); локальная same-device полоса 145–192 GB/s; кросс-shared USM = OUT_OF_DEVICE_MEMORY; peer/IPC NA (S02). Дефолт коллективов TP — host-USM staging; peer — runtime fast-path по `zeDeviceCanAccessPeer` |
 | 2026-10-17 | S04 Stage1.1 TPCoordinator | **частично** (код+тест готовы) | TP-ветка `compile_model`, `TPCoordinator`, `TPCompiledModel`, свойства (`model_distribution_policy`/`enable_tensor_parallel`/`tp_ranks`), GATE-тест `tensor_parallel.cpp` написаны. **GATE по сборке не подтверждён**: тулчейн (cl 14.44/cmake/ninja) есть, но ВСЕ сабмодули пусты (`git submodule status` → все с `-`; напр. `thirdparty/ittapi/ittapi`, `gtest`, `json/nlohmann_json`, `ocl/*`, `intel_gpu/thirdparty/onednn_gpu` = 0 файлов) → cmake configure падает (`ittapi::ittnotify does not represent a cmake target`). Инициализация сабмодулей = сетевой fetch → запрещён политикой. См. «Блокеры» |
 | 2026-10-17 | S05 Stage1.2 TPInferRequest | **частично** (код+тест готовы) | Заглушка rank-0 заменена на `TPInferRequest` (`include/.../tp/tp_infer_request.hpp`, `src/.../tp/tp_infer_request.cpp`): k per-rank sub-запросов, репликация входов (общий host-тензор в `set_tensor` + memcpy rank0→rankN в `infer()` для lazy-буферов), выходы только rank0; `infer()` — последовательно по рангам (MVP). `TPCompiledModel::create_infer_request()` → `create_async_infer_request<>()` (обёртка `ov::IAsyncInferRequest` на выделенном `CPUStreamsExecutor`), `create_sync_infer_request()` → `TPInferRequest`. GATE-тест `TensorParallelInferMatchesSingleGpu` (паритет TP2 vs 1-GPU, доп. модель `make_tp_parity_model` с различными весами, SKIP <2 GPU). **GATE по сборке/прогону не подтверждён** — сабмодули по-прежнему пусты (см. S04/«Блокеры»)
+| 2026-10-17 | S06 Stage2.1 TPShardTransform | **частично** (код+тест готовы) | Добавлен identity/analysis OV-пасс `TPShardTransform` (`src/plugin/transformations/tp_shard_transform.{hpp,cpp}`): детектит `MatMul`/`FullyConnected`(`Compressed`), классифицирует (N_SPLIT/K_SPLIT/REPLICA) детерминированно, пишет `std::vector<TPSeam>` в `model->get_rt_info()` под ключом `intel_gpu_tp_seams`. Пасс регистрируется в `TransformationsPipeline::apply` **только при TP** (policy{TENSOR_PARALLEL} ИЛИ `enable_tensor_parallel`) — до фьюжнов/LowPrecision и семантически до `propagate_constants`. `TPPlan`/`TPSeamKind`/`TPCollectiveKind` расширены (`tp_plan.hpp` + новый `tp_plan.cpp`), `TPCoordinator::compile_model_tensor_parallel` собирает seams ранга-0 в план. Новое RO-свойство `ov::intel_gpu::tp_seams` (`vector<string>`, формат `KIND:COLLECTIVE:TYPE:NAME`) на `TPCompiledModel` и пустое на обычном/плагинном. Тесты S06 в `tensor_parallel.cpp` (детект+стабильность, K_SPLIT-классификация residual-проекции, TP-off регресс). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); identity подтверждается контрактом пасса (return false, только rt_info) |
 
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
@@ -49,6 +50,7 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
+  Актуально для S05 и S06: GATE подтверждён по коду/плану, прогон `tensor_parallel` тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
   не изменяем. Формулировка «push» в старых записях/промптах считается снятой.
@@ -56,6 +58,45 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S06 done (частично, 2026-10-17)** — Stage 2.1 TPShardTransform-скелет. Артефакты:
+  - Новый OV-пасс `TPShardTransform` (`src/plugins/intel_gpu/src/plugin/transformations/tp_shard_transform.hpp`,
+    `.cpp`): `ov::pass::ModelPass`, `run_on_model` возвращает **false** (identity — граф не меняется).
+    Идет по `model->get_ordered_ops()` (детерминированный порядок), для каждого `MatMul`/`FullyConnected`
+    (`FullyConnectedCompressed`) создаёт `TPSeam{node_name,node_type,kind,collective}` и пишет весь
+    `std::vector<TPSeam>` в `model->get_rt_info()[ov::intel_gpu::tp_seams_rt_info_key()]` (ключ
+    `"intel_gpu_tp_seams"`). Никакого среза/all-gather/allreduce — только метаданные.
+  - **Классификация (консервативная, детерминированная):** нет константных весов (операнд 1) → `REPLICA`;
+    иначе если выход фида в `ov::op::v1::Add` (residual-проекция, выход→Add) → `K_SPLIT`
+    (`ALL_REDUCE_SUM`); иначе → `N_SPLIT` (`ALL_GATHER`). Для Qwen это даёт qkv/gate/up = N_SPLIT,
+    o_proj/down_proj = K_SPLIT (совпадает с PLAN §4.3). Attention-скоры (Q·Kᵀ, B не константа) = REPLICA.
+  - **Точка вставки:** `TransformationsPipeline::apply` — основной блок `ov::pass::Manager("Plugin:GPU")`,
+    регистрация `TPShardTransform` сразу после `set_per_pass_validation(false)` и **до** `SDPAToVLSDPA`;
+    при этом `MatMul` ещё не сконвертирован в FC (`ConvertMatMulToFullyConnected` только на ~:1740).
+    Гейт активности: `config.get_enable_tensor_parallel() || policy.count(TENSOR_PARALLEL)` — при обычной
+    компиляции пасс НЕ регистрируется (регресс TP-off сохранён).
+  - **Транспорт метаданных:** `tp_plan.hpp` (расширен: `TPSeamKind{NONE,N_SPLIT,K_SPLIT,REPLICA}`,
+    `TPCollectiveKind{NONE,ALL_GATHER,ALL_REDUCE_SUM}`, поля `node_name/node_type/collective/split_axis/
+    shard_dim_size` — последние два placeholder для S07/S08; `tp_seam_to_string()`); новый `tp_plan.cpp`
+    (`set_tp_seams`/`get_tp_seams` через model rt_info, `to_string`). `TPCoordinator::
+    compile_model_tensor_parallel` после `clone_and_transform_model` ранга-0 вызывает
+    `get_tp_seams(transformed_model)` и кладёт в `plan.seams`. Выбран вариант «rt_info модели +
+    сбор после clone_and_transform_model», минимум инвазивности.
+  - **API для теста:** RO-свойство `ov::intel_gpu::tp_seams` (`std::vector<std::string>`,
+    `"KIND:COLLECTIVE:TYPE:NAME"`) — `internal_properties.hpp`; отдаётся `TPCompiledModel`,
+    пусто на обычном `CompiledModel`/плагине; в supported props везде.
+  - **Тесты S06** (в `tensor_parallel.cpp`): `ShardTransformDetectsAndReportsSeams` (1 шов
+    `N_SPLIT:ALL_GATHER:MatMul:*`, стабильность при повторной компиляции, наличие в supported),
+    `ShardTransformClassifiesResidualProjectionAsKSplit` (MatMul→Add = `K_SPLIT:ALL_REDUCE_SUM`),
+    `DefaultCompileHasNoSeams` (TP-off: пустые seams/ranks). Негативы S04 и паритет S05 не тронуты.
+  - **НЕ делалось (S07+):** реальный срез весов, all-gather/allreduce, коллективы, per-rank KV;
+    `split_axis`/`shard_dim_size` не заполняются. `make_plan()` по-прежнему даёт только ranks;
+    seams досыпаются в compile-ветке.
+  - **Заметка S06→S07:** S07 = N-split + all-gather-эквивалент. Срез констант делать в
+    `TPShardTransform` (он уже стоит до `propagate_constants`, PLAN §4.2/§7.2): заменить Constant-веса
+    на слайс `[.., n_start:n_end]` (N-split по out-channels, целыми oc-группами), добавить узел сборки
+    (сейчас — identity; в S07 полный выходной буфер без арифметики). GATE — FC/MLP-сеть cos>0.999.
+    ВНИМАНИЕ: все ранги сейчас получают ОДИН И ТОТ ЖЕ transformed model (clone per-rank), пасс должен
+    получать rank-индекс (сейчас планируется через `tp_ranks`/config), иначе срез будет одинаковым.
 - **S05 done (частично, 2026-10-17)** — Stage 1.2 TPInferRequest. Артефакты:
   - Новый sync-запрос `TPInferRequest` (`src/plugins/intel_gpu/include/intel_gpu/plugin/tp/tp_infer_request.hpp`,
     `src/plugins/intel_gpu/src/plugin/tp/tp_infer_request.cpp`): держит `m_rank_requests`

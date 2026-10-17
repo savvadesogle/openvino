@@ -29,6 +29,16 @@ static constexpr Property<std::string, PropertyMutability::RO> driver_version{"G
 static constexpr Property<std::vector<int32_t>, PropertyMutability::RO> tp_ranks{"TP_RANKS"};
 
 /**
+ * @brief Read-only property reporting the tensor-parallel seams of a compiled model.
+ * The value is a deterministic list of encoded seams (see ov::intel_gpu::tp_seam_to_string),
+ * one per detected MatMul/FullyConnected node; it is empty for non-TP compilation.
+ * Seams are metadata only: no weight slicing or collective is performed (S06 skeleton).
+ *
+ * [TP-GPU, S06] Experimental GPU tensor-parallel support. See PLAN.md §4.2, §4.3.
+ */
+static constexpr Property<std::vector<std::string>, PropertyMutability::RO> tp_seams{"TP_SEAMS"};
+
+/**
  * @brief Internal/test flag that enables tensor-parallel compilation of a model.
  * Equivalent to requesting ov::hint::model_distribution_policy{TENSOR_PARALLEL}. It is mainly
  * intended for functional tests (mirrors ov::intel_cpu::enable_tensor_parallel).

@@ -7,6 +7,7 @@
 #include "intel_gpu/plugin/tp/tp_compiled_model.hpp"
 
 #include "intel_gpu/plugin/tp/tp_infer_request.hpp"
+#include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/runtime/itt.hpp"
 #include "openvino/core/except.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
@@ -66,11 +67,20 @@ ov::Any TPCompiledModel::get_property(const std::string& name) const {
     if (name == ov::supported_properties) {
         auto props = m_ranks.front()->get_property(name).as<std::vector<ov::PropertyName>>();
         props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_ranks.name(), PropertyMutability::RO});
+        props.emplace_back(ov::PropertyName{ov::intel_gpu::tp_seams.name(), PropertyMutability::RO});
         props.emplace_back(ov::PropertyName{ov::hint::model_distribution_policy.name(), PropertyMutability::RO});
         return props;
     }
     if (name == ov::intel_gpu::tp_ranks) {
         return decltype(ov::intel_gpu::tp_ranks)::value_type{m_plan.ranks};
+    }
+    if (name == ov::intel_gpu::tp_seams) {
+        std::vector<std::string> seams;
+        seams.reserve(m_plan.seams.size());
+        for (const auto& seam : m_plan.seams) {
+            seams.push_back(tp_seam_to_string(seam));
+        }
+        return decltype(ov::intel_gpu::tp_seams)::value_type{std::move(seams)};
     }
     if (name == ov::hint::model_distribution_policy) {
         return decltype(ov::hint::model_distribution_policy)::value_type{ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};

@@ -7,14 +7,18 @@
 //      ov::intel_gpu::tp_ranks.
 // S05: TPInferRequest executes the replicated graph on both ranks and exposes rank-0 outputs;
 //      the result must match a single-GPU reference inference (e2e parity).
-// See PLAN.md §4.1, §4.2, §4.4, §5 (S04, S05).
+// S06: TPShardTransform (identity/analysis) detects MatMul/FullyConnected seams and reports
+//      them via ov::intel_gpu::tp_seams; the graph/numbers are unchanged (S05 parity holds).
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5 (S04, S05, S06).
 
+#include <algorithm>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "common_test_utils/ov_tensor_utils.hpp"
 #include "openvino/core/model.hpp"
+#include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/parameter.hpp"
@@ -35,6 +39,17 @@ std::shared_ptr<ov::Model> make_fc_mini_model() {
     auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
     auto result = std::make_shared<ov::op::v0::Result>(matmul);
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_fc_mini");
+}
+
+// A projection whose (partial) output is added back to a residual stream: the heuristic in
+// TPShardTransform must classify it as K_SPLIT (all-reduce(sum)) rather than N_SPLIT.
+std::shared_ptr<ov::Model> make_residual_projection_model() {
+    auto input = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 8});
+    auto weights = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{8, 16}, {1});
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(input, weights, false, false);
+    auto add = std::make_shared<ov::op::v1::Add>(matmul, matmul);
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{input}, "tp_residual_proj");
 }
 
 // Same topology but with distinctive, non-uniform weights: parity mismatches caused by a rank
@@ -178,6 +193,65 @@ TEST_F(TensorParallelCompileGPU, TensorParallelInferMatchesSingleGpu) {
 
     ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
     ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+}
+
+// [S06] GATE: TPShardTransform must detect the MatMul seam and report it via tp_seams.
+// The list must be non-empty, classified and stable across repeated compilations.
+TEST_F(TensorParallelCompileGPU, ShardTransformDetectsAndReportsSeams) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    std::shared_ptr<ov::Model> shared_model = model;
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+
+    auto compiled = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props);
+    auto seams = compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u) << "Expected exactly one detected MatMul seam";
+    // Format: "<kind>:<collective>:<node_type>:<node_name>".
+    EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+
+    // Determinism/stability: recompiling the same model yields an identical seam list.
+    auto compiled_again = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props);
+    auto seams_again = compiled_again.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    EXPECT_EQ(seams, seams_again);
+
+    // The seam list must be advertised among the supported properties.
+    auto supported = compiled.get_property(ov::supported_properties).as<std::vector<ov::PropertyName>>();
+    EXPECT_NE(std::find(supported.begin(), supported.end(), ov::intel_gpu::tp_seams.name()), supported.end());
+}
+
+// [S06] Classification: a projection whose output is added back to the residual stream is
+// classified as K_SPLIT (all-reduce(sum)); the mini model above stays N_SPLIT (all-gather).
+TEST_F(TensorParallelCompileGPU, ShardTransformClassifiesResidualProjectionAsKSplit) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto residual_model = make_residual_projection_model();
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+
+    auto compiled = core.compile_model(residual_model, ov::test::utils::DEVICE_GPU, props);
+    auto seams = compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u) << "Expected exactly one detected MatMul seam";
+    EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+}
+
+// [S06] Regression: TP-off compilation must not run the pass and must report no seams/ranks.
+TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoSeams) {
+    ov::Core core;
+    std::shared_ptr<ov::Model> shared_model = model;
+
+    ov::CompiledModel compiled_model;
+    OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU));
+    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    EXPECT_TRUE(seams.empty());
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    EXPECT_TRUE(ranks.empty());
 }
 
 }  // namespace

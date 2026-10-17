@@ -82,6 +82,7 @@
 #include "openvino/pass/constant_folding.hpp"
 #include "openvino/pass/manager.hpp"
 #include "openvino/pass/sdpa_to_vlsdpa.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "ov_ops/gather_matmul_compressed.hpp"
 #include "plugin/transformations/bcast_and_pad_zp_buffers.hpp"
 #include "plugin/transformations/binary_conv_to_conv.hpp"
@@ -128,6 +129,7 @@
 #include "plugin/transformations/remove_fq_before_dw_conv.hpp"
 #include "plugin/transformations/sink_reshape.hpp"
 #include "plugin/transformations/transpose_fusion.hpp"
+#include "plugin/transformations/tp_shard_transform.hpp"
 #include "plugin/transformations/sdpa_transpose_fusion.hpp"
 #include "plugin/transformations/unsqueeze_broadcast_reshape_matmul_fusion.hpp"
 #include "plugin/transformations/expand_broadcast_reshape_sdpa_fusion.hpp"
@@ -641,6 +643,19 @@ void TransformationsPipeline::apply(std::shared_ptr<ov::Model> func) {
         ov::pass::Manager manager("Plugin:GPU");
         auto pass_config = manager.get_pass_config();
         manager.set_per_pass_validation(false);
+
+        // [TP-GPU, S06] Tensor-parallel seam detection. This pass runs only when tensor
+        // parallelism is requested (policy {TENSOR_PARALLEL} or the internal flag) so that
+        // the default (TP-off) compilation path stays byte-for-byte identical to upstream.
+        // It is analysis-only and is registered before any fusion/LowPrecision pass and,
+        // semantically, before propagate_constants, so that later stages (S07/S08) can slice
+        // the weights before they are uploaded to the device (PLAN.md §4.2, §7.2).
+        const bool tp_requested =
+            config.get_enable_tensor_parallel() ||
+            config.get_model_distribution_policy().count(ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL) > 0;
+        if (tp_requested) {
+            manager.register_pass<ov::intel_gpu::TPShardTransform>();
+        }
 
         // Transformation of SDPA to VLSDPA for QWen2.x-VL,
         // Note: this should be applied before TransposeFusion.

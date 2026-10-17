@@ -30,7 +30,8 @@ TPPlan TPCoordinator::make_plan() const {
         plan.ranks.push_back(r.rank);
         plan.rank_device_ids.push_back(r.device_id);
     }
-    // Seam classification is intentionally empty in S04: no sharding has been applied yet.
+    // Seam classification is filled in by compile_model_tensor_parallel from the seams
+    // detected by TPShardTransform (see get_tp_seams); make_plan only knows the rank table.
     return plan;
 }
 
@@ -75,12 +76,21 @@ std::shared_ptr<ov::ICompiledModel> Plugin::compile_model_tensor_parallel(const 
     TPCoordinator coordinator(std::move(rank_contexts));
     auto plan = coordinator.make_plan();
 
-    // 2) Compile the (unsharded) model once per rank through the existing single-device path.
-    //    TPShardTransform is a no-op in S04: every rank currently receives the full graph.
+    // 2) Compile the model once per rank through the existing single-device path.
+    //    In S06 TPShardTransform is an identity/analysis pass: every rank receives the full
+    //    graph, but the detected seams are collected into the plan (see below).
     std::vector<std::shared_ptr<CompiledModel>> rank_models;
     rank_models.reserve(coordinator.num_ranks());
+    bool seams_collected = false;
     for (auto& rc : coordinator.ranks()) {
         auto transformed_model = clone_and_transform_model(model, rc.config, rc.context);
+        // [S06] TPShardTransform stamped the detected seams into the transformed model's
+        // rt_info. All ranks transform the identical graph, so rank 0 is representative;
+        // collect once to keep the plan deterministic and rank-independent.
+        if (!seams_collected && rc.rank == 0) {
+            plan.seams = get_tp_seams(transformed_model);
+            seams_collected = true;
+        }
         rc.config.finalize(rc.context.get(), transformed_model.get());
         rank_models.push_back(std::make_shared<CompiledModel>(transformed_model, shared_from_this(), rc.context, rc.config));
     }
