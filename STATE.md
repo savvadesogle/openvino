@@ -22,7 +22,7 @@
 - [x] S06 Stage2.1 TPShardTransform-скелет (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S07 Stage2.2 N-split + all-gather (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S08 Stage2.3 K-split + allreduce (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S09 Stage2.4 int4_ASYM
+- [x] S09 Stage2.4 int4_ASYM (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S10 Stage3.1 per-rank KV
 - [ ] S11 Stage3.2 linear_attention
 - [ ] S12 Stage3.3 Hard (dynamic/events/concurrency)
@@ -45,6 +45,8 @@
 
 | 2026-10-17 | S08 Stage2.3 K-split + allreduce | **частично** (код+тест готовы) | **K-split весов**: `TPShardTransform` для `K_SPLIT` с константными весами (2D) режет Constant по K-оси (`find_weight_k_axis`: `transpose_b=false`→axis 0 `[K,N]`, `true`→axis 1 `[N,K]`), `offset=rank*K/ranks`, `K % ranks == 0`, элемент ≥8 бит (int4 → S09). **K-срез активации**: A-операнд (input 0) режется по последней оси через `ov::op::v8::Slice` (start/stop/step/axis=-1) — каждый ранг считает истинную частичную GEMM-сумму `A_r @ W_r` (не «A_full @ W_r», который размерно некорректен). **Численный инвариант**: выбирается вариант (б) из промпта (срез и весов, и активации); K-границы кратны `group_size` при int4 (S09), на S08 `group_size=1`. **Replicated additive terms**: `scan_k_reduction` проходит по потребителям K-узла через elementwise и собирает `Add`-слагаемые, которые реплицированы на каждом ранге: Constant (bias) и/или прямой вход-`Parameter` (residual). Истинный residual, произведённый внутри графа (не Constant/не Parameter), или не-elementwise потребитель → узел НЕ режется (корректность требует device-side allreduce ДО Add — S09+); классификация (`seam.kind=K_SPLIT`) при этом сохраняется (стабильность `tp_seams`). **Allreduce(sum)**: `TPInferRequest::assemble_reduce_sum` суммирует per-rank выходы в fp32 (PLAN §7.4), затем вычитает `(num_ranks-1)*term` для каждого replicated-слагаемого (bias/residual добавляются ровно один раз), затем кастует к выходному типу. `TPOutputSeam.collective` + `replicated_adds`; новый RO-property `ov::intel_gpu::tp_output_seams`. `build_output_ports` решейпит только `ALL_GATHER`. Тесты: `KsplitResidualParityMatchesSingleGpu` (residual-Parameter + bias-Constant, TP2 vs 1-GPU cos>0.999, проверка `tp_output_seams==ALL_REDUCE_SUM`), `KsplitNotDivisibleFallsBackToReplica` (K=7, без среза, `tp_output_seams=={}`, паритет). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
 
+| 2026-10-17 | S09 Stage2.4 int4_ASYM | **частично** (код+тест готовы) | **Распознавание dequant-подграфа**: на момент `TPShardTransform` (до `MarkDequantization`/конвертации FC) int4-проекции — это `MatMul` с dequant-цепочкой на операнде 1: `weight(u4 [..,N,G,gs]) -> Convert(f16) -> Subtract(Convert(zp)) -> Multiply(scale) -> Reshape([..,N,K]) -> Convert(f32)`, поэтому `has_constant_weights` был false и int4-узлы были REPLICA (S06–S08). `match_quantized_weight` распознаёт эту форму (weight/scale/zp/reshape + group_axis/group_size/num_groups). **Срез**: N-split режет weight+scale+zp по N-оси целыми oc-чанками и обновляет target `Reshape` (`n_out→count`), плюс bias-Add-константы; K-split режет weight+scale+zp по group-оси целиком группами (`G % num_ranks == 0`, т.е. K кратно `group_size*num_ranks`) и обновляет `Reshape` (`K→count_g*gs`); активация режется как в S08 (`v8::Slice` по последней оси). **Sub-byte выравнивание**: `slice_is_byte_aligned` (row/off/slab_bits % 8) — правило именно `row_bits`, а не `inner_bits`; невыровненный/неделимый случай → REPLICA (без throw), классификация K_SPLIT сохраняется. zp per-tensor (один элемент) НЕ режется. Реальный Qwen остаётся в основном REPLICA (элементные цепочки достигают следующего GEMM → нужен inter-node all-gather, S10+; o_proj/down_proj residual внутренний → K-split небезопасен, S08-ограничение). Тесты: `Int4NsplitParityMatchesSingleGpu`, `Int4KsplitParityMatchesSingleGpu` (cos>0.999 + проверка `tp_output_seams`), `Int4KsplitIndivisibleFallsBackToReplica` (G=9, без all-reduce). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -54,7 +56,7 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
-  Актуально для S05, S06, S07 и S08: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
+  Актуально для S05, S06, S07, S08 и S09: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
   тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
@@ -63,6 +65,56 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S09 done (частично, 2026-10-17)** — Stage 2.4 int4_ASYM. Артефакты/решения:
+  - **Что видит пасс**: `TPShardTransform` вставлен на `transformations_pipeline.cpp:660` — ДО
+    `MarkDequantization` (`:701`) и до конвертации `MatMul`→`FullyConnectedCompressed` (`:1758/:1763`).
+    Значит, int4-проекции на входе пасса — это `MatMul`, у которого операнд 1 = dequant-подграф
+    (НЕ `FullyConnectedCompressed`). Проверено по `models/Qwen3.5-9B-int4-ov/openvino_language_model.xml`.
+  - **Форма dequant-подграфа** (эталонно задокументирована в `docs/notes/int4-asym-weights.md`):
+    `weight(u4 [..,N,G,gs]) -> Convert(f16) -> Subtract(Convert(zp u4 [..,N,G,1])) -> Multiply(scale f16
+    [..,N,G,1]) -> Reshape([..,N,K]) -> Convert(f32) -> MatMul(transpose_b=true)`. Пример Qwen `in_proj_qkv`:
+    weight u4 `[8192,32,128]` (N=8192,K=4096,G=32,gs=128), zp u4 `[8192,32,1]`, scale f16 `[8192,32,1]`.
+  - **`match_quantized_weight`** (в `tp_shard_transform.cpp`) идёт от операнда 1 вглубь до Constant(u4),
+    собирая `weight/scale/zero_point/reshape`; `group_axis = rank-2`, `group_size = last dim`,
+    `num_groups = weight.shape[group_axis]`. `has_constant_weights` теперь принимает и bare-Constant,
+    и dequant-подграф → int4-узлы корректно классифицируются (N_SPLIT/K_SPLIT вместо REPLICA).
+  - **Срез N-split int4** (`apply_nsplit_quantized`): режет weight по N-оси (== 0 для `[N,G,gs]`) целыми
+    oc-чанками; scale/zp — по их N-оси; пересобирает упомянутую в `Reshape` N (`n_out→n_out/ranks`) новым
+    i64-Constant; bias-Add-константы режутся по последней оси. `n_axis != group_axis` и `!= last`.
+  - **Срез K-split int4** (`apply_ksplit_quantized`): режет weight/scale/zp по group-оси ЦЕЛЫМИ группами,
+    `G % num_ranks == 0` (⇔ K кратно `group_size*num_ranks`); `Reshape` target `K→count_g*gs`; активация —
+    как в S08 (`slice_last_axis` по последней оси, offset=`rank*count_g*gs`). zp per-tensor (1 элемент)
+    НЕ режется (`shape_size==1` → keep as-is).
+  - **Правило выравнивания sub-byte** (важно!): байтовое выравнивание проверяется как
+    `row_bits % 8 && off_bits % 8 && slab_bits % 8`, где `row_bits = shape[axis]*inner*bitwidth`
+    (`inner` = произведение осей ПОСЛЕ axis). НЕ `inner_bits%8` (это была бы ошибка). Невыровненный срез →
+    fallback REPLICA (без throw); `slice_constant` бросает `OPENVINO_ASSERT` только при прямом неверном вызове.
+  - **`is_sliceable_type`** теперь допускает любую статическую ширину >0 (было ≥8 бит) — выравнивание
+    энфорсит `slice_is_byte_aligned`. Это безопасно для bare-весов ≥8 бит.
+  - **Безопасность потребителей (обновлено)**: `scan_nsplit_consumers` (заменил `consumers_are_slice_safe`) —
+    BFS по elementwise: не-elementwise потребитель (следующий GEMM) → unsafe; полновесный непостоянный Add
+    (residual) → unsafe; Add-Constant шириной N → собирается в `side_constants` и режется. `big` Qwen
+    qkv/gate/up достигают другого GEMM → REPLICA (нужен inter-node all-gather, S10+). o_proj/down_proj
+    residual внутренний → K-split unsafe (S08). Т.е. реальный Qwen GATE пока недостижим → GATE частичный.
+  - **`is_sliceable_type`/bare-путь S07/S08 не сломан**: `apply_nsplit_bare`/`apply_ksplit_bare` теперь
+    также проверяют `slice_is_byte_aligned` (для ≥8 бит всегда true).
+  - **Артефакты**: `src/plugin/transformations/tp_shard_transform.cpp` (главные правки),
+    `docs/notes/int4-asym-weights.md` (новый конспект), тесты в `tensor_parallel.cpp`
+    (`Int4NsplitParityMatchesSingleGpu`, `Int4KsplitParityMatchesSingleGpu`,
+    `Int4KsplitIndivisibleFallsBackToReplica` + билдеры `int4_asym_dequant_weights`/`make_int4_*`).
+    CMake не правился: `src/plugin/**/*.cpp` и тесты подхватываются GLOB.
+  - **ОГРАНИЧЕНИЯ S09 (важно для S10+):**
+    1. Inter-node all-gather между двумя GEMM-ами (N-split → следующий GEMM) НЕ реализован → большинство
+       реальных Qwen-проекций остаются REPLICA. Это S10+ (или требует device-side коллективов).
+    2. Внутренний residual (`x + o_proj(attn)`) по-прежнему не K-сплитится (нужен device-side allreduce
+       ДО Add) — как S08.
+    3. `match_quantized_weight` не разбирает `Transpose` в цепочке (нестандартный layout → fallback REPLICA).
+    4. Групповые границы предполагают континуальный K-индекс (gs-блоки идут подряд по K) — стандартный
+       int4_ASYM OV-layout; иные упаковки не поддержаны.
+  - **Заметка S09→S10**: S10 = per-rank KV + GQA heads + агрегация state. Точки: `TPInferRequest::query_state`
+    сейчас только rank-0; per-rank `Stateful`/KV нужно собирать/агрегировать. GATE — greedy 32-token
+    паритет против 1-GPU на Qwen3.5-9B-int4. После S10 реальные attention-проекции могут начать резаться
+    (нужен all-gather), что сделает полный Qwen GATE возможным.
 - **S08 done (частично, 2026-10-17)** — Stage 2.3 K-split + all-reduce(sum). Артефакты/решения:
   - **Выбор по срезу активации — вариант (б)**: и веса, и активация режутся по K. Прямой вариант (а)
     («A_full @ W[:,k_r]») размерно некорректен (несовпадение K), поэтому отвергнут. Веса — `slice_constant`

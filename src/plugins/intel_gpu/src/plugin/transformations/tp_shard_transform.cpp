@@ -12,7 +12,14 @@
 //    partial GEMM sum; record K-split model outputs that must be all-reduced (summed) on
 //    rank 0 with fp32 accumulation. Replicated bias/residual terms (a constant or a model
 //    input folded by a residual Add) are recorded so the reducer adds them exactly ONCE.
-// See PLAN.md §4.2, §4.3, §7.4.
+//  - S09: int4_ASYM (group quantized). Before MarkDequantization/FC conversion the int4 weights
+//    appear as a dequantization subgraph (weight u4 [.., N, G, gs] -> Convert -> Subtract(zp) ->
+//    Multiply(scale) -> Reshape([.., N, K]) -> Convert). The pass recognizes this form and slices
+//    weight + scale + zero_point together (and a bias Add constant for N-split) along group
+//    boundaries: N-split keeps whole out-channel chunks, K-split keeps whole groups (K multiple of
+//    group_size * num_ranks). Sub-byte (u4/i4) slices are byte-aligned or the node falls back to
+//    REPLICA. See docs/notes/int4-asym-weights.md.
+// See PLAN.md §2, §4.2, §4.3, §7.4.
 
 #include "tp_shard_transform.hpp"
 
@@ -31,6 +38,7 @@
 #include "intel_gpu/plugin/tp/tp_plan.hpp"
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include "openvino/core/rt_info.hpp"
+#include "openvino/core/rt_info/weightless_caching_attributes.hpp"
 #include "openvino/core/type.hpp"
 #include "openvino/core/type/bfloat16.hpp"
 #include "openvino/core/type/float16.hpp"
@@ -51,6 +59,7 @@
 #include "openvino/op/negative.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/relu.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/sigmoid.hpp"
 #include "openvino/op/slice.hpp"
@@ -83,12 +92,129 @@ std::string classify_node_type(const std::shared_ptr<ov::Node>& node) {
     return node->get_type_name();
 }
 
-//! The weight matrix B is operand 1 for both MatMul and FullyConnected.
+// ---------------------------------------------------------------------------------------------
+// [S09] INT4_ASYM (group-quantized) weight recognition.
+//
+// Before MarkDequantization / FC conversion the int4 weights of a linear projection appear as a
+// dequantization subgraph (the on-disk model is plain OV IR), e.g.:
+//   weight(u4 [N,G,gs]) -> Convert(f16) -> Subtract(zp[f16 N,G,1])
+//                       -> Multiply(scale[f16 N,G,1]) -> Reshape([N,K]) -> Convert(f32) -> MatMul(B)
+// with group_size gs=128, G=K/gs groups. The pass must recognize this form (input 1 is not a
+// bare Constant) and slice weight/scale/zero_point together along group boundaries so per-rank
+// slices remain a valid INT4_ASYM quantization (PLAN §2, §4.2, §4.3). See int4-asym-weights.md.
+// ---------------------------------------------------------------------------------------------
+
+//! True for the low-bit integer element types used for compressed (quantized) weights.
+bool is_quantized_weight_type(const ov::element::Type& et) {
+    return et.is_integral() && !et.is_dynamic() && et.bitwidth() > 0 && et.bitwidth() <= 8;
+}
+
+//! Unwraps a Constant that may be preceded by a single Convert (the pattern wraps scale/zp in a
+//! Convert in some variants). Returns nullptr otherwise.
+std::shared_ptr<ov::op::v0::Constant> unwrap_constant(const std::shared_ptr<ov::Node>& node) {
+    if (auto c = ov::as_type_ptr<ov::op::v0::Constant>(node)) {
+        return c;
+    }
+    if (ov::is_type<ov::op::v0::Convert>(node)) {
+        return ov::as_type_ptr<ov::op::v0::Constant>(node->input_value(0).get_node_shared_ptr());
+    }
+    return nullptr;
+}
+
+//! A recognized group-quantized (INT4_ASYM) weight subgraph feeding a GEMM's B operand.
+struct QuantizedWeight {
+    std::shared_ptr<ov::op::v0::Constant> weight;      //!< u4/i4/u2/... constant [.., N, G, gs]
+    std::shared_ptr<ov::op::v0::Constant> scale;       //!< floating scale constant (may be null)
+    std::shared_ptr<ov::op::v0::Constant> zero_point;  //!< integer zero-point constant (may be null)
+    std::shared_ptr<ov::op::v1::Reshape> reshape;      //!< [.., N, G, gs] -> [.., N, K] (nullable)
+    ov::Shape weight_shape;
+    size_t group_axis = 0;  //!< axis of the group index G in the weight shape
+    size_t group_size = 0;  //!< gs (innermost grouping dimension)
+    size_t num_groups = 0;  //!< G
+};
+
+//! Matches the linear dequantization chain feeding @p gemm input 1 (see the comment above).
+bool match_quantized_weight(const std::shared_ptr<ov::Node>& gemm, QuantizedWeight& qw) {
+    if (gemm->get_input_size() < 2) {
+        return false;
+    }
+    auto cur = gemm->input_value(1).get_node_shared_ptr();
+    for (int guard = 0; cur && guard < 16; ++guard) {
+        if (auto c = ov::as_type_ptr<ov::op::v0::Constant>(cur)) {
+            if (!is_quantized_weight_type(c->get_element_type())) {
+                return false;
+            }
+            qw.weight = c;
+            qw.weight_shape = c->get_shape();
+            break;
+        }
+        if (ov::is_type<ov::op::v0::Convert>(cur)) {
+            cur = cur->input_value(0).get_node_shared_ptr();
+            continue;
+        }
+        if (auto r = ov::as_type_ptr<ov::op::v1::Reshape>(cur)) {
+            if (!qw.reshape) {
+                qw.reshape = r;
+            }
+            cur = cur->input_value(0).get_node_shared_ptr();
+            continue;
+        }
+        if (auto mul = ov::as_type_ptr<ov::op::v1::Multiply>(cur)) {
+            auto sc = unwrap_constant(mul->input_value(1).get_node_shared_ptr());
+            if (sc) {
+                cur = mul->input_value(0).get_node_shared_ptr();
+            } else {
+                sc = unwrap_constant(mul->input_value(0).get_node_shared_ptr());
+                if (!sc) {
+                    return false;
+                }
+                cur = mul->input_value(1).get_node_shared_ptr();
+            }
+            if (!qw.scale) {
+                qw.scale = sc;
+            }
+            continue;
+        }
+        if (auto sub = ov::as_type_ptr<ov::op::v1::Subtract>(cur)) {
+            auto zc = unwrap_constant(sub->input_value(1).get_node_shared_ptr());
+            if (!zc) {
+                return false;
+            }
+            if (!qw.zero_point) {
+                qw.zero_point = zc;
+            }
+            cur = sub->input_value(0).get_node_shared_ptr();
+            continue;
+        }
+        return false;  // Transpose or any other op -> unsupported layout (fallback)
+    }
+    if (!qw.weight) {
+        return false;
+    }
+    // Group quantization only: weight layout must be [.., N, G, gs] with G == K / gs.
+    if (qw.weight_shape.size() < 3) {
+        return false;
+    }
+    qw.group_axis = qw.weight_shape.size() - 2;
+    qw.group_size = qw.weight_shape.back();
+    if (qw.group_size == 0) {
+        return false;
+    }
+    qw.num_groups = qw.weight_shape[qw.group_axis];
+    return true;
+}
+
+//! The weight matrix B is operand 1 for both MatMul and FullyConnected. Accepts both a bare
+//! constant and an int4_ASYM dequantization subgraph (S09).
 bool has_constant_weights(const std::shared_ptr<ov::Node>& node) {
     if (node->get_input_size() < 2) {
         return false;
     }
-    return ov::is_type<ov::op::v0::Constant>(node->input_value(1).get_node());
+    if (ov::is_type<ov::op::v0::Constant>(node->input_value(1).get_node())) {
+        return true;
+    }
+    QuantizedWeight qw;
+    return match_quantized_weight(node, qw);
 }
 
 //! Heuristic for "this GEMM is a projection whose partial N result is added back to the
@@ -166,13 +292,38 @@ int64_t find_weight_k_axis(const std::shared_ptr<ov::Node>& node, const ov::Shap
     return transpose_b ? 1 : 0;
 }
 
-//! Element types that can be bit-copied while slicing. Sub-byte (u4/i4) weight types are
-//! handled together with their scales/zp in S09 (group quantization).
+//! Element types that can be bit-copied while slicing. Any static width is allowed; sub-byte
+//! (u4/i4/u2) slices must additionally be byte-aligned, enforced at slice time.
 bool is_sliceable_type(const ov::element::Type& et) {
-    return !et.is_dynamic() && et.bitwidth() >= 8;
+    return !et.is_dynamic() && et.bitwidth() > 0;
 }
 
-//! Slices a constant along @p axis into [offset, offset + count) (element-aligned types only).
+//! True when slicing [offset, offset + count) along @p axis of @p shape keeps whole bytes (i.e.
+//! no nibble/element pair is split). Required for sub-byte (int4/u4/u2) weights/scale/zp
+//! (PLAN §2). For >=8-bit element types this is always satisfied.
+bool slice_is_byte_aligned(const ov::Shape& shape,
+                           int64_t axis,
+                           int64_t offset,
+                           int64_t count,
+                           int64_t bitwidth) {
+    if (axis < 0 || axis >= static_cast<int64_t>(shape.size()) || bitwidth <= 0) {
+        return false;
+    }
+    size_t inner = 1;
+    for (size_t i = axis + 1; i < shape.size(); ++i) {
+        inner *= shape[i];
+    }
+    const size_t row_bits = shape[axis] * inner * static_cast<size_t>(bitwidth);
+    const size_t off_bits = static_cast<size_t>(offset) * inner * static_cast<size_t>(bitwidth);
+    const size_t slab_bits = static_cast<size_t>(count) * inner * static_cast<size_t>(bitwidth);
+    // The source row stride, the slice start and the slice slab must all fall on byte boundaries so
+    // no sub-byte element pair is split (PLAN §2).
+    return row_bits % 8 == 0 && off_bits % 8 == 0 && slab_bits % 8 == 0;
+}
+
+//! Slices a constant along @p axis into [offset, offset + count). A bit-copy keeps the exact bit
+//! pattern (including packed u4/i4 nibbles); callers must guarantee byte alignment for sub-byte
+//! types via slice_is_byte_aligned().
 std::shared_ptr<ov::op::v0::Constant> slice_constant(const std::shared_ptr<ov::op::v0::Constant>& src,
                                                      int64_t axis,
                                                      int64_t offset,
@@ -180,14 +331,12 @@ std::shared_ptr<ov::op::v0::Constant> slice_constant(const std::shared_ptr<ov::o
     const auto et = src->get_element_type();
     const auto shape = src->get_shape();
     OPENVINO_ASSERT(axis >= 0 && axis < static_cast<int64_t>(shape.size()),
-                    "[GPU][TP] N-split: invalid weights axis ", axis);
-    // Sub-byte types (u4/i4) are handled in S09 (group quantization); reject explicitly here.
-    OPENVINO_ASSERT(et.bitwidth() >= 8, "[GPU][TP] N-split slicing of sub-byte weight type ", et,
-                    " is not supported yet (int4 is S09)");
-    const size_t elem_bytes = et.size();
+                    "[GPU][TP] slice: invalid weights axis ", axis);
+    OPENVINO_ASSERT(is_sliceable_type(et), "[GPU][TP] slice: unsupported element type ", et);
+    const int64_t bitwidth = et.bitwidth();
     const size_t axis_dim = shape[axis];
     OPENVINO_ASSERT(offset >= 0 && count >= 0 && static_cast<size_t>(offset + count) <= axis_dim,
-                    "[GPU][TP] N-split: range [", offset, ", ", offset + count, ") out of bounds for axis dim ",
+                    "[GPU][TP] slice: range [", offset, ", ", offset + count, ") out of bounds for axis dim ",
                     axis_dim);
 
     size_t outer = 1;
@@ -199,18 +348,24 @@ std::shared_ptr<ov::op::v0::Constant> slice_constant(const std::shared_ptr<ov::o
         inner *= shape[i];
     }
 
+    const size_t row_bits = axis_dim * inner * static_cast<size_t>(bitwidth);
+    const size_t off_bits = static_cast<size_t>(offset) * inner * static_cast<size_t>(bitwidth);
+    const size_t slab_bits = static_cast<size_t>(count) * inner * static_cast<size_t>(bitwidth);
+    OPENVINO_ASSERT(off_bits % 8 == 0 && slab_bits % 8 == 0 && row_bits % 8 == 0,
+                    "[GPU][TP] slice: sub-byte ", et, " slice along axis ", axis, " offset ", offset,
+                    " is not byte-aligned");
+
     ov::Shape out_shape(shape.begin(), shape.end());
     out_shape[axis] = static_cast<size_t>(count);
 
-    // Raw pointer walks the source as [outer, axis_dim, inner] blocks; each rank gets a
-    // contiguous [count, inner] slab per outer index. Byte copy keeps the exact bit pattern.
+    const size_t row_bytes = row_bits / 8;
+    const size_t off_bytes = off_bits / 8;
+    const size_t slab_bytes = slab_bits / 8;
     const auto* in = static_cast<const uint8_t*>(src->get_data_ptr());
-    std::vector<uint8_t> out(outer * static_cast<size_t>(count) * inner * elem_bytes);
-    const size_t slab_bytes = static_cast<size_t>(count) * inner * elem_bytes;
+    std::vector<uint8_t> out(outer * slab_bytes);
     for (size_t o = 0; o < outer; ++o) {
-        const uint8_t* src_base = in + (o * axis_dim + static_cast<size_t>(offset)) * inner * elem_bytes;
-        uint8_t* dst_base = out.data() + o * slab_bytes;
-        std::memcpy(dst_base, src_base, slab_bytes);
+        const uint8_t* src_base = in + o * row_bytes + off_bytes;
+        std::memcpy(out.data() + o * slab_bytes, src_base, slab_bytes);
     }
     return std::make_shared<ov::op::v0::Constant>(et, out_shape, out.data());
 }
@@ -409,15 +564,288 @@ void classify_seam(const std::shared_ptr<ov::Node>& node, TPSeam& seam) {
     }
 }
 
-//! True if every consumer of @p node's output is element-wise or a Result, i.e. the sliced
-//! output can safely be assembled from per-rank slices (S07 scope). Any other consumer (e.g.
-//! a chained GEMM that needs the full N) is out of scope for S07.
-bool consumers_are_slice_safe(const std::shared_ptr<ov::Node>& node) {
-    for (const auto& target : node->output(0).get_target_inputs()) {
-        const auto consumer = target.get_node()->shared_from_this();
-        if (!is_elementwise(consumer) && !ov::is_type<ov::op::v0::Result>(consumer)) {
+//! Result of analyzing the downstream (element-wise) consumers of an N-split node.
+struct NSplitScan {
+    bool safe = true;
+    int64_t n_out = -1;
+    // Add-constants (bias) reachable through element-wise ops that must be sliced along the last
+    // (out-channel) axis together with the weights.
+    std::vector<std::shared_ptr<ov::op::v0::Constant>> side_constants;
+};
+
+//! Walks the downstream element-wise consumers of an N-split node. The node may only be N-split if
+//! the assembled slice never feeds a further GEMM (which would need the full N: requires a real
+//! inter-node all-gather, out of scope) and any residual Add operand is either a constant bias
+//! (sliced) or broadcast-compatible. Any non-element-wise node (a GEMM) or a full-width
+//! non-constant Add operand makes the node unsafe (falls back to REPLICA).
+void scan_nsplit_consumers(const std::shared_ptr<ov::Node>& start, int64_t n_out, NSplitScan& scan) {
+    scan.n_out = n_out;
+    std::unordered_set<const ov::Node*> visited{start.get()};
+    std::vector<std::shared_ptr<ov::Node>> work{start};
+    while (!work.empty()) {
+        auto cur = work.back();
+        work.pop_back();
+        for (const auto& target : cur->output(0).get_target_inputs()) {
+            auto consumer = target.get_node()->shared_from_this();
+            if (ov::is_type<ov::op::v0::Result>(consumer)) {
+                continue;
+            }
+            if (!is_elementwise(consumer)) {
+                scan.safe = false;  // a GEMM (or other non-element-wise op) needs the full N
+                continue;
+            }
+            if (ov::is_type<ov::op::v1::Add>(consumer)) {
+                auto in0 = consumer->input_value(0).get_node_shared_ptr();
+                auto in1 = consumer->input_value(1).get_node_shared_ptr();
+                std::shared_ptr<ov::Node> other;
+                if (in0.get() == cur.get()) {
+                    other = in1;
+                } else if (in1.get() == cur.get()) {
+                    other = in0;
+                }
+                if (other) {
+                    if (auto c = ov::as_type_ptr<ov::op::v0::Constant>(other)) {
+                        const auto shape = c->get_shape();
+                        if (!shape.empty() && shape.back() == static_cast<size_t>(n_out)) {
+                            scan.side_constants.push_back(c);
+                        }
+                    } else {
+                        const auto other_pshape = other->get_output_partial_shape(0);
+                        if (other_pshape.rank().is_static() && other_pshape.rank().get_length() >= 1) {
+                            const auto& last = other_pshape[other_pshape.rank().get_length() - 1];
+                            if (last.is_static() && last.get_length() == n_out) {
+                                scan.safe = false;  // full-width residual: needs device-side handling
+                            }
+                        }
+                    }
+                }
+            }
+            if (visited.insert(consumer.get()).second) {
+                work.push_back(consumer);
+            }
+        }
+    }
+}
+
+//! Replaces every consumer of a constant with @p new_c and transfers naming/rt_info.
+void replace_constant(const std::shared_ptr<ov::op::v0::Constant>& old_c,
+                      const std::shared_ptr<ov::op::v0::Constant>& new_c,
+                      const std::string& suffix) {
+    new_c->set_friendly_name(old_c->get_friendly_name() + suffix);
+    ov::copy_runtime_info(old_c, new_c);
+    ov::copy_weightless_cache_attr(old_c, new_c);
+    for (auto& target : old_c->output(0).get_target_inputs()) {
+        target.replace_source_output(new_c->output(0));
+    }
+}
+
+//! Index of the first axis of @p shape equal to @p dim (preferring @p preferred); -1 if none.
+int64_t find_axis_of(const ov::Shape& shape, size_t dim, size_t preferred) {
+    if (preferred < shape.size() && shape[preferred] == dim) {
+        return static_cast<int64_t>(preferred);
+    }
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (shape[i] == dim) {
+            return static_cast<int64_t>(i);
+        }
+    }
+    return -1;
+}
+
+//! Prepares an updated Reshape shape constant replacing @p old_dim with @p new_dim (no mutation).
+std::shared_ptr<ov::op::v0::Constant> prepare_shape_update(const std::shared_ptr<ov::op::v1::Reshape>& reshape,
+                                                           int64_t old_dim,
+                                                           int64_t new_dim) {
+    if (!reshape) {
+        return nullptr;
+    }
+    auto sc = ov::as_type_ptr<ov::op::v0::Constant>(reshape->input_value(1).get_node_shared_ptr());
+    if (!sc || sc->get_element_type() != ov::element::i64) {
+        return nullptr;
+    }
+    auto vals = sc->cast_vector<int64_t>();
+    bool found = false;
+    for (auto& v : vals) {
+        if (v == old_dim) {
+            v = new_dim;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return nullptr;
+    }
+    auto nc = ov::op::v0::Constant::create(ov::element::i64, sc->get_shape(), vals);
+    ov::copy_runtime_info(sc, nc);
+    return nc;
+}
+
+//! Prepares the byte-aligned slice of an optional scale/zp constant along @p axis (skips per-tensor
+//! constants with a single element, which must not be sliced). Returns false if unsliceable.
+bool prepare_side_slice(const std::shared_ptr<ov::op::v0::Constant>& c,
+                        int64_t axis,
+                        int64_t offset,
+                        int64_t count,
+                        std::shared_ptr<ov::op::v0::Constant>& out) {
+    if (!c) {
+        out = nullptr;
+        return true;
+    }
+    if (ov::shape_size(c->get_shape()) == 1) {
+        out = nullptr;  // per-tensor: keep as-is (never sliced, PLAN §2 / cpu-tp-pattern §5)
+        return true;
+    }
+    if (axis < 0 || !is_sliceable_type(c->get_element_type()) ||
+        !slice_is_byte_aligned(c->get_shape(), axis, offset, count, c->get_element_type().bitwidth())) {
+        return false;
+    }
+    out = slice_constant(c, axis, offset, count);
+    return true;
+}
+
+//! N-split of a bare-constant weight: slice the N axis + matching bias Add/FC-bias constants.
+bool apply_nsplit_bare(const std::shared_ptr<ov::Node>& node,
+                       const std::shared_ptr<ov::op::v0::Constant>& weights,
+                       int64_t n_out,
+                       int64_t offset,
+                       int64_t count,
+                       const NSplitScan& scan) {
+    const int64_t axis = find_weight_split_axis(node, weights->get_shape(), n_out);
+    if (axis < 0 || weights->get_shape()[axis] != static_cast<size_t>(n_out) ||
+        !is_sliceable_type(weights->get_element_type()) ||
+        !slice_is_byte_aligned(weights->get_shape(), axis, offset, count, weights->get_element_type().bitwidth())) {
+        return false;
+    }
+    std::vector<std::pair<std::shared_ptr<ov::op::v0::Constant>, std::shared_ptr<ov::op::v0::Constant>>> sides;
+    for (const auto& c : scan.side_constants) {
+        const auto shape = c->get_shape();
+        if (shape.empty() || shape.back() != static_cast<size_t>(n_out)) {
             return false;
         }
+        const int64_t a = static_cast<int64_t>(shape.size()) - 1;
+        if (!slice_is_byte_aligned(shape, a, offset, count, c->get_element_type().bitwidth())) {
+            return false;
+        }
+        sides.emplace_back(c, slice_constant(c, a, offset, count));
+    }
+    auto sliced_weights = slice_constant(weights, axis, offset, count);
+    replace_constant(weights, sliced_weights, "_tp_rank");
+    slice_bias_if_present(node, n_out, offset, count);
+    for (auto& s : sides) {
+        replace_constant(s.first, s.second, "_tp_nrank");
+    }
+    return true;
+}
+
+//! N-split of an int4_ASYM dequant subgraph: slice weight + scale + zp along the N axis (whole
+//! out-channel chunks), update the Reshape target and bias Add constants.
+bool apply_nsplit_quantized(const std::shared_ptr<ov::Node>& node,
+                            const QuantizedWeight& qw,
+                            int64_t n_out,
+                            int64_t offset,
+                            int64_t count,
+                            const NSplitScan& scan) {
+    const auto& wshape = qw.weight_shape;
+    const int64_t n_axis = find_axis_of(wshape, static_cast<size_t>(n_out), 0);
+    if (n_axis < 0 || n_axis == static_cast<int64_t>(qw.group_axis) ||
+        n_axis == static_cast<int64_t>(wshape.size()) - 1 ||
+        !is_sliceable_type(qw.weight->get_element_type()) ||
+        !slice_is_byte_aligned(wshape, n_axis, offset, count, qw.weight->get_element_type().bitwidth())) {
+        return false;
+    }
+    std::shared_ptr<ov::op::v0::Constant> sliced_scale, sliced_zp;
+    const int64_t scale_axis = qw.scale ? find_axis_of(qw.scale->get_shape(), static_cast<size_t>(n_out), 0) : -1;
+    const int64_t zp_axis = qw.zero_point ? find_axis_of(qw.zero_point->get_shape(), static_cast<size_t>(n_out), 0) : -1;
+    if (!prepare_side_slice(qw.scale, scale_axis, offset, count, sliced_scale) ||
+        !prepare_side_slice(qw.zero_point, zp_axis, offset, count, sliced_zp)) {
+        return false;
+    }
+    std::shared_ptr<ov::op::v0::Constant> new_shape_const;
+    if (qw.reshape) {
+        new_shape_const = prepare_shape_update(qw.reshape, n_out, count);
+        if (!new_shape_const) {
+            return false;
+        }
+    }
+    std::vector<std::pair<std::shared_ptr<ov::op::v0::Constant>, std::shared_ptr<ov::op::v0::Constant>>> sides;
+    for (const auto& c : scan.side_constants) {
+        const auto shape = c->get_shape();
+        if (shape.empty() || shape.back() != static_cast<size_t>(n_out)) {
+            return false;
+        }
+        const int64_t a = static_cast<int64_t>(shape.size()) - 1;
+        if (!slice_is_byte_aligned(shape, a, offset, count, c->get_element_type().bitwidth())) {
+            return false;
+        }
+        sides.emplace_back(c, slice_constant(c, a, offset, count));
+    }
+    auto sliced_weights = slice_constant(qw.weight, n_axis, offset, count);
+    replace_constant(qw.weight, sliced_weights, "_tp_rank");
+    if (sliced_scale) {
+        replace_constant(qw.scale, sliced_scale, "_tp_nrank");
+    }
+    if (sliced_zp) {
+        replace_constant(qw.zero_point, sliced_zp, "_tp_nrank");
+    }
+    if (qw.reshape && new_shape_const) {
+        qw.reshape->input(1).replace_source_output(new_shape_const);
+    }
+    for (auto& s : sides) {
+        replace_constant(s.first, s.second, "_tp_nrank");
+    }
+    return true;
+}
+
+//! K-split of a bare-constant 2D weight: slice the contraction axis.
+bool apply_ksplit_bare(const std::shared_ptr<ov::op::v0::Constant>& weights,
+                       int64_t k_axis,
+                       int64_t offset,
+                       int64_t count) {
+    if (k_axis < 0 || !is_sliceable_type(weights->get_element_type()) ||
+        !slice_is_byte_aligned(weights->get_shape(), k_axis, offset, count, weights->get_element_type().bitwidth())) {
+        return false;
+    }
+    auto sliced = slice_constant(weights, k_axis, offset, count);
+    replace_constant(weights, sliced, "_tp_krank");
+    return true;
+}
+
+//! K-split of an int4_ASYM dequant subgraph: slice weight + scale + zp along the group axis (whole
+//! groups) and update the Reshape target. Each rank keeps G/num_ranks groups (K multiple of
+//! group_size * num_ranks).
+bool apply_ksplit_quantized(const QuantizedWeight& qw, int64_t offset_g, int64_t count_g) {
+    const auto& wshape = qw.weight_shape;
+    const int64_t ga = static_cast<int64_t>(qw.group_axis);
+    if (!is_sliceable_type(qw.weight->get_element_type()) ||
+        !slice_is_byte_aligned(wshape, ga, offset_g, count_g, qw.weight->get_element_type().bitwidth())) {
+        return false;
+    }
+    std::shared_ptr<ov::op::v0::Constant> sliced_scale, sliced_zp;
+    const int64_t scale_axis = qw.scale ? find_axis_of(qw.scale->get_shape(), qw.num_groups, 0) : -1;
+    const int64_t zp_axis = qw.zero_point ? find_axis_of(qw.zero_point->get_shape(), qw.num_groups, 0) : -1;
+    if (!prepare_side_slice(qw.scale, scale_axis, offset_g, count_g, sliced_scale) ||
+        !prepare_side_slice(qw.zero_point, zp_axis, offset_g, count_g, sliced_zp)) {
+        return false;
+    }
+    const int64_t k_dim = static_cast<int64_t>(qw.num_groups * qw.group_size);
+    const int64_t new_k = static_cast<int64_t>(count_g * qw.group_size);
+    std::shared_ptr<ov::op::v0::Constant> new_shape_const;
+    if (qw.reshape) {
+        new_shape_const = prepare_shape_update(qw.reshape, k_dim, new_k);
+        if (!new_shape_const) {
+            return false;
+        }
+    }
+    auto sliced_weights = slice_constant(qw.weight, ga, offset_g, count_g);
+    replace_constant(qw.weight, sliced_weights, "_tp_krank");
+    if (sliced_scale) {
+        replace_constant(qw.scale, sliced_scale, "_tp_krank");
+    }
+    if (sliced_zp) {
+        replace_constant(qw.zero_point, sliced_zp, "_tp_krank");
+    }
+    if (qw.reshape && new_shape_const) {
+        qw.reshape->input(1).replace_source_output(new_shape_const);
     }
     return true;
 }
@@ -426,7 +854,6 @@ bool consumers_are_slice_safe(const std::shared_ptr<ov::Node>& node) {
 
 bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
     const bool sharding_active = m_num_ranks > 1 && m_rank >= 0 && m_rank < m_num_ranks;
-    const bool group_size_is_one = true;  // int4 group quantization is handled in S09
 
     // Geometry of a node that was actually sliced for this rank.
     struct SlicedNodeInfo {
@@ -455,67 +882,76 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
         classify_seam(node, seam);
 
         if (sharding_active && seam.kind == TPSeamKind::N_SPLIT) {
-            const auto weights = ov::as_type_ptr<ov::op::v0::Constant>(node->input_value(1).get_node_shared_ptr());
+            const auto bare_weights = ov::as_type_ptr<ov::op::v0::Constant>(node->input_value(1).get_node_shared_ptr());
+            QuantizedWeight qw;
+            const bool quantized = !bare_weights && match_quantized_weight(node, qw);
             const auto out_pshape = node->get_output_partial_shape(0);
-            if (weights && out_pshape.rank().is_static() && out_pshape.rank().get_length() >= 1 &&
+            bool sliced = false;
+            int64_t n_out = -1;
+            bool divisible = false;
+            if ((bare_weights || quantized) && out_pshape.rank().is_static() &&
+                out_pshape.rank().get_length() >= 1 &&
                 out_pshape[out_pshape.rank().get_length() - 1].is_static()) {
-                const int64_t n_out = out_pshape[out_pshape.rank().get_length() - 1].get_length();
-                const int64_t axis = find_weight_split_axis(node, weights->get_shape(), n_out);
-                const bool divisible = (n_out > 0) && (n_out % m_num_ranks == 0);
-                const bool safe_consumers = consumers_are_slice_safe(node);
-                const bool splittable = axis >= 0 && divisible && safe_consumers && group_size_is_one &&
-                                        is_sliceable_type(weights->get_element_type()) &&
-                                        weights->get_shape()[axis] == static_cast<size_t>(n_out);
-
-                if (splittable) {
+                n_out = out_pshape[out_pshape.rank().get_length() - 1].get_length();
+                divisible = (n_out > 0) && (n_out % m_num_ranks == 0);
+                if (divisible) {
                     const int64_t count = n_out / m_num_ranks;
                     const int64_t offset = static_cast<int64_t>(m_rank) * count;
-                    auto sliced_weights = slice_constant(weights, axis, offset, count);
-                    sliced_weights->set_friendly_name(weights->get_friendly_name() + "_tp_rank");
-                    ov::copy_runtime_info(weights, sliced_weights);
-                    node->input(1).replace_source_output(sliced_weights);
-                    slice_bias_if_present(node, n_out, offset, count);
-
-                    seam.split_axis = -1;  // N is the last dimension of the GEMM output
-                    seam.shard_dim_size = n_out;
-
-                    SlicedNodeInfo info;
-                    info.is_k = false;
-                    info.split_axis = seam.split_axis;
-                    info.shard_dim_size = seam.shard_dim_size;
-                    sliced_nodes[node.get()] = std::move(info);
-                    graph_modified = true;
-                    GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform N-split rank " << m_rank << "/" << m_num_ranks
-                                   << " " << node->get_friendly_name() << ": N=" << n_out
-                                   << " slice=[" << offset << ", " << offset + count << ") axis=" << axis << std::endl;
-                } else {
-                    // Graceful degradation instead of a hard failure: keep the node replicated
-                    // so numerics remain correct (documented in STATE.md, S07).
-                    seam.kind = TPSeamKind::REPLICA;
-                    seam.collective = TPCollectiveKind::NONE;
-                    GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform keeps N_SPLIT node replicated (rank " << m_rank
-                                   << "): " << node->get_friendly_name() << " N=" << n_out
-                                   << " axis=" << axis << " divisible=" << divisible
-                                   << " safe_consumers=" << safe_consumers << std::endl;
+                    NSplitScan scan;
+                    scan_nsplit_consumers(node, n_out, scan);
+                    if (scan.safe) {
+                        if (bare_weights) {
+                            sliced = apply_nsplit_bare(node, bare_weights, n_out, offset, count, scan);
+                        } else {
+                            sliced = apply_nsplit_quantized(node, qw, n_out, offset, count, scan);
+                        }
+                    }
                 }
+            }
+            if (sliced) {
+                seam.split_axis = -1;  // N is the last dimension of the GEMM output
+                seam.shard_dim_size = n_out;
+
+                SlicedNodeInfo info;
+                info.is_k = false;
+                info.split_axis = seam.split_axis;
+                info.shard_dim_size = seam.shard_dim_size;
+                sliced_nodes[node.get()] = std::move(info);
+                graph_modified = true;
+                GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform N-split rank " << m_rank << "/" << m_num_ranks
+                               << " " << node->get_friendly_name() << ": N=" << n_out
+                               << " quantized=" << quantized << " slice=[" << m_rank * (n_out / m_num_ranks)
+                               << ", " << (m_rank + 1) * (n_out / m_num_ranks) << ")" << std::endl;
             } else {
+                // Graceful degradation instead of a hard failure: keep the node replicated
+                // so numerics remain correct (documented in STATE.md, S07/S09).
                 seam.kind = TPSeamKind::REPLICA;
                 seam.collective = TPCollectiveKind::NONE;
+                GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform keeps N_SPLIT node replicated (rank " << m_rank
+                               << "): " << node->get_friendly_name() << " N=" << n_out
+                               << " quantized=" << quantized << " divisible=" << divisible << std::endl;
             }
         } else if (sharding_active && seam.kind == TPSeamKind::K_SPLIT) {
             // [S08] K-split: each rank computes a partial GEMM sum over its slice of the
             // contraction dimension; the reducer sums the partials (all-reduce sum, fp32).
-            const auto weights = ov::as_type_ptr<ov::op::v0::Constant>(node->input_value(1).get_node_shared_ptr());
+            const auto bare_weights = ov::as_type_ptr<ov::op::v0::Constant>(node->input_value(1).get_node_shared_ptr());
+            QuantizedWeight qw;
+            const bool quantized = !bare_weights && match_quantized_weight(node, qw);
             const auto in0_pshape = node->get_input_partial_shape(0);
             const auto out_pshape = node->get_output_partial_shape(0);
 
             int64_t k_axis = -1;
             int64_t k_dim = -1;
-            if (weights) {
-                k_axis = find_weight_k_axis(node, weights->get_shape());
+            int64_t group_size = 1;
+            if (bare_weights) {
+                k_axis = find_weight_k_axis(node, bare_weights->get_shape());
                 if (k_axis >= 0) {
-                    k_dim = static_cast<int64_t>(weights->get_shape()[k_axis]);
+                    k_dim = static_cast<int64_t>(bare_weights->get_shape()[k_axis]);
                 }
+            } else if (quantized) {
+                k_axis = static_cast<int64_t>(qw.group_axis);
+                group_size = static_cast<int64_t>(qw.group_size);
+                k_dim = static_cast<int64_t>(qw.num_groups * qw.group_size);
             }
             int64_t act_k = -1;
             if (in0_pshape.rank().is_static() && in0_pshape.rank().get_length() >= 1) {
@@ -530,9 +966,13 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
                 transpose_a = mm->get_transpose_a();
             }
             const bool out_static = out_pshape.is_static();
-            const bool divisible = (k_dim > 0) && (k_dim % m_num_ranks == 0);
-            const bool shape_ok = weights && k_axis >= 0 && !transpose_a && act_k == k_dim && out_static &&
-                                  is_sliceable_type(weights->get_element_type());
+            // int4_ASYM: the contraction axis must be sliced whole groups (K multiple of
+            // group_size * num_ranks), i.e. num_groups divisible by num_ranks (PLAN §2).
+            const bool divisible = quantized ? (qw.num_groups > 0 && (qw.num_groups % m_num_ranks == 0))
+                                             : ((k_dim > 0) && (k_dim % m_num_ranks == 0));
+            const bool shape_ok = !transpose_a && act_k == k_dim && out_static &&
+                                  ((bare_weights && k_axis >= 0 && is_sliceable_type(bare_weights->get_element_type())) ||
+                                   (quantized && is_sliceable_type(qw.weight->get_element_type())));
 
             KReduceScan scan;
             if (shape_ok && divisible) {
@@ -585,36 +1025,51 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
             }
 
             if (shape_ok && divisible && scan.safe && adds_ok) {
-                const int64_t count = k_dim / m_num_ranks;
-                const int64_t offset = static_cast<int64_t>(m_rank) * count;
+                int64_t offset = 0;
+                int64_t count = 0;
+                bool applied = false;
+                if (bare_weights) {
+                    // 1a) slice the constant weights along the contraction axis
+                    count = k_dim / m_num_ranks;
+                    offset = static_cast<int64_t>(m_rank) * count;
+                    applied = apply_ksplit_bare(bare_weights, k_axis, offset, count);
+                } else {
+                    // 1b) slice the dequant subgraph along the group axis (whole groups)
+                    const int64_t count_g = static_cast<int64_t>(qw.num_groups / m_num_ranks);
+                    const int64_t offset_g = static_cast<int64_t>(m_rank) * count_g;
+                    offset = offset_g * group_size;
+                    count = count_g * group_size;
+                    applied = apply_ksplit_quantized(qw, offset_g, count_g);
+                }
 
-                // 1) slice the constant weights along the contraction axis
-                auto sliced_weights = slice_constant(weights, k_axis, offset, count);
-                sliced_weights->set_friendly_name(weights->get_friendly_name() + "_tp_krank");
-                ov::copy_runtime_info(weights, sliced_weights);
-                node->input(1).replace_source_output(sliced_weights);
+                if (applied) {
+                    // 2) slice the activation operand on its last (contraction) axis so each rank
+                    //    holds the matching input slice (only its K range is uploaded/computed).
+                    auto act_slice = slice_last_axis(node->input_value(0), offset, offset + count);
+                    act_slice->set_friendly_name(node->get_friendly_name() + "_tp_act");
+                    node->input(0).replace_source_output(act_slice->output(0));
 
-                // 2) slice the activation operand on its last (contraction) axis so each rank
-                //    holds the matching input slice (only its K range is uploaded/computed).
-                auto act_slice = slice_last_axis(node->input_value(0), offset, offset + count);
-                act_slice->set_friendly_name(node->get_friendly_name() + "_tp_act");
-                node->input(0).replace_source_output(act_slice->output(0));
+                    seam.split_axis = k_axis;
+                    seam.shard_dim_size = k_dim;
 
-                seam.split_axis = k_axis;
-                seam.shard_dim_size = k_dim;
-
-                SlicedNodeInfo info;
-                info.is_k = true;
-                info.split_axis = k_axis;
-                info.shard_dim_size = k_dim;
-                info.replicated_adds = std::move(replicated_adds);
-                sliced_nodes[node.get()] = std::move(info);
-                graph_modified = true;
-                GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform K-split rank " << m_rank << "/" << m_num_ranks
-                               << " " << node->get_friendly_name() << ": K=" << k_dim
-                               << " slice=[" << offset << ", " << offset + count << ") k_axis=" << k_axis
-                               << " replicated_adds=" << scan.constants.size() << "+" << scan.input_indices.size()
-                               << std::endl;
+                    SlicedNodeInfo info;
+                    info.is_k = true;
+                    info.split_axis = k_axis;
+                    info.shard_dim_size = k_dim;
+                    info.replicated_adds = std::move(replicated_adds);
+                    sliced_nodes[node.get()] = std::move(info);
+                    graph_modified = true;
+                    GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform K-split rank " << m_rank << "/" << m_num_ranks
+                                   << " " << node->get_friendly_name() << ": K=" << k_dim
+                                   << " quantized=" << quantized << " slice=[" << offset << ", " << offset + count
+                                   << ") k_axis=" << k_axis
+                                   << " replicated_adds=" << scan.constants.size() << "+" << scan.input_indices.size()
+                                   << std::endl;
+                } else {
+                    GPU_DEBUG_INFO << "[GPU][TP] TPShardTransform K-split not applied (rank " << m_rank
+                                   << "): " << node->get_friendly_name()
+                                   << " (unsafe sub-byte/byte alignment) -> replica" << std::endl;
+                }
             } else {
                 // Unsliced K-split stays a replication (each rank computes the full GEMM);
                 // classification (seam.kind) is left unchanged so tp_seams stays stable.

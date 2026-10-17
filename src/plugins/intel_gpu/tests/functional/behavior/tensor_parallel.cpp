@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05/S07/S08] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08/S09] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -15,7 +15,12 @@
 // S08: K-split - TPShardTransform slices the constant weights AND the activation along the
 //      contraction axis; each rank computes a partial GEMM sum; rank 0 all-reduces (fp32 sum)
 //      and adds the replicated bias/residual terms exactly once.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04, S05, S06, S07, S08).
+// S09: int4_ASYM group quantized - TPShardTransform recognizes the dequant subgraph feeding the
+//      GEMM B operand (weight u4 [N,G,gs] -> Convert -> Subtract(zp) -> Multiply(scale) ->
+//      Reshape -> Convert) and slices weight + scale + zero_point on group boundaries (N-split:
+//      whole out-channel chunks; K-split: whole groups, K multiple of group_size * num_ranks).
+//      Indivisible/unsliceable cases fall back to REPLICA.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04, S05, S06, S07, S08, S09).
 
 #include <algorithm>
 #include <cmath>
@@ -32,10 +37,14 @@
 #include "openvino/core/type/float16.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/matmul.hpp"
+#include "openvino/op/multiply.hpp"
 #include "openvino/op/parameter.hpp"
 #include "openvino/op/relu.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/runtime/core.hpp"
 #include "openvino/runtime/intel_gpu/properties.hpp"
 #include "openvino/runtime/properties.hpp"
@@ -151,6 +160,78 @@ std::shared_ptr<ov::Model> make_ksplit_indivisible_model() {
     auto add_residual = std::make_shared<ov::op::v1::Add>(matmul, residual);
     auto result = std::make_shared<ov::op::v0::Result>(add_residual);
     return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{x, residual}, "tp_ksplit_indivisible");
+}
+
+// [S09] Builds the int4_ASYM group-quantized dequantization subgraph feeding the GEMM B operand:
+//   weight(u4 [N, G, gs]) -> Convert(f16) -> Subtract(zp[u4->f16 N,G,1])
+//                         -> Multiply(scale[f16 N,G,1]) -> Reshape([N, K]) -> Convert(f32)
+// evaluated exactly (w = (q - zp) * scale) so the reference graph computes the true dequantized
+// weights. Slicing weight/scale/zp on group boundaries must keep the result identical.
+ov::Output<ov::Node> int4_asym_dequant_weights(size_t n, size_t k, size_t gs) {
+    OPENVINO_ASSERT(k % gs == 0, "[TP] int4 test: K must be a multiple of group_size");
+    const size_t g = k / gs;
+    std::vector<int32_t> q(n * g * gs);
+    std::vector<int32_t> zp(n * g);
+    std::vector<ov::float16> scale(n * g);
+    for (size_t nn = 0; nn < n; ++nn) {
+        for (size_t gg = 0; gg < g; ++gg) {
+            zp[nn * g + gg] = static_cast<int32_t>((nn * 3 + gg * 5) % 16);
+            scale[nn * g + gg] = static_cast<ov::float16>(0.01f * static_cast<float>(1 + ((nn + gg) % 5)));
+            for (size_t j = 0; j < gs; ++j) {
+                q[(nn * g + gg) * gs + j] = static_cast<int32_t>((nn + gg + j) % 16);
+            }
+        }
+    }
+    auto w = ov::op::v0::Constant::create(ov::element::u4, ov::Shape{n, g, gs}, q);
+    auto zp_c = ov::op::v0::Constant::create(ov::element::u4, ov::Shape{n, g, 1}, zp);
+    auto sc_c = ov::op::v0::Constant::create(ov::element::f16, ov::Shape{n, g, 1}, scale);
+    auto w_f = std::make_shared<ov::op::v0::Convert>(w, ov::element::f16);
+    auto zp_f = std::make_shared<ov::op::v0::Convert>(zp_c, ov::element::f16);
+    auto sub = std::make_shared<ov::op::v1::Subtract>(w_f, zp_f);
+    auto mul = std::make_shared<ov::op::v1::Multiply>(sub, sc_c);
+    auto rp = ov::op::v0::Constant::create(ov::element::i64,
+                                           ov::Shape{2},
+                                           std::vector<int64_t>{static_cast<int64_t>(n), static_cast<int64_t>(k)});
+    auto reshape = std::make_shared<ov::op::v1::Reshape>(mul, rp, false);
+    auto dq = std::make_shared<ov::op::v0::Convert>(reshape, ov::element::f32);
+    return dq->output(0);
+}
+
+// [S09] N-split int4 model: Parameter -> MatMul(dequant int4 weights) -> Relu -> Result. The GEMM
+// output terminates the model through an element-wise activation, so it is N-split (all-gather).
+std::shared_ptr<ov::Model> make_int4_nsplit_model(size_t n = 4096, size_t k = 1024, size_t gs = 128) {
+    auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, k});
+    auto dequant = int4_asym_dequant_weights(n, k, gs);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(x, dequant, false, true);
+    auto relu = std::make_shared<ov::op::v0::Relu>(matmul);
+    auto result = std::make_shared<ov::op::v0::Result>(relu);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{x}, "tp_int4_nsplit");
+}
+
+// [S09] K-split int4 model: Parameter(x) -> MatMul(dequant int4) -> Add(residual) -> Add(bias)
+// -> Result. The projection feeds a residual Add, so it is classified K_SPLIT (all-reduce sum);
+// the replicated residual (input) and bias (constant) must be added exactly once by the reducer.
+std::shared_ptr<ov::Model> make_int4_ksplit_model(size_t n = 4096, size_t k = 1024, size_t gs = 128) {
+    auto x = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, k});
+    auto residual = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, n});
+    auto dequant = int4_asym_dequant_weights(n, k, gs);
+    auto matmul = std::make_shared<ov::op::v0::MatMul>(x, dequant, false, true);
+    std::vector<float> bias_data(n);
+    for (size_t i = 0; i < n; ++i) {
+        bias_data[i] = 0.02f * static_cast<float>((i % 7) + 1) - 0.07f;
+    }
+    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{n}, bias_data);
+    auto add_residual = std::make_shared<ov::op::v1::Add>(matmul, residual);
+    auto add_bias = std::make_shared<ov::op::v1::Add>(add_residual, bias);
+    auto result = std::make_shared<ov::op::v0::Result>(add_bias);
+    return std::make_shared<ov::Model>(ov::ResultVector{result}, ov::ParameterVector{x, residual}, "tp_int4_ksplit");
+}
+
+// [S09] Negative: the number of groups (G = K/gs) is not divisible by the number of ranks, so the
+// contraction axis cannot be sliced on group boundaries -> the node must fall back to replication
+// (K_SPLIT classification preserved, no all-reduce output) and still match single-GPU inference.
+std::shared_ptr<ov::Model> make_int4_ksplit_indivisible_model(size_t n = 4096, size_t k = 1152, size_t gs = 128) {
+    return make_int4_ksplit_model(n, k, gs);  // k/gs = 9 groups (odd)
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -578,6 +659,172 @@ TEST_F(TensorParallelCompileGPU, KsplitNotDivisibleFallsBackToReplica) {
     // ... but nothing was sliced, so there is no assembly output (rank 0 computes the full result).
     auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
     EXPECT_TRUE(output_seams.empty());
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(0, input);
+    tp_request.set_input_tensor(1, residual);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999);
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S09] GATE: N-split of an int4_ASYM group-quantized projection. Each rank holds only its
+// out-channel chunk of weight + scale + zero_point (whole groups on the K axis are preserved);
+// rank 0 exposes the full [1, N] result assembled by all-gather, matching single-GPU inference.
+TEST_F(TensorParallelCompileGPU, Int4NsplitParityMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t n = 4096;
+    const size_t k = 1024;
+    auto ref_model = make_int4_nsplit_model(n, k);
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, k});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < k; ++i) {
+            data[i] = 0.05f * static_cast<float>((i % 11) + 1) - 0.3f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(input);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(output_seams.size(), 1u) << "Expected the int4 N-split to set up an all-gather output";
+    EXPECT_EQ(output_seams[0].rfind("ALL_GATHER:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(input);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    ASSERT_EQ(tp_output.get_shape(), (ov::Shape{1, n}));
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999)
+        << "int4 N-split all-gather output diverged from the single-GPU reference";
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S09] GATE: K-split of an int4_ASYM projection. Each rank keeps its whole-group slice of
+// weight + scale + zero_point (G divisible by the number of ranks) and computes a partial GEMM;
+// rank 0 all-reduces (fp32 sum) and adds the replicated residual/bias exactly once.
+TEST_F(TensorParallelCompileGPU, Int4KsplitParityMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t n = 4096;
+    const size_t k = 1024;
+    auto ref_model = make_int4_ksplit_model(n, k);
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, k});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < k; ++i) {
+            data[i] = 0.05f * static_cast<float>((i % 9) + 1) - 0.25f;
+        }
+    }
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, n});
+    {
+        auto* data = residual.data<float>();
+        for (size_t i = 0; i < n; ++i) {
+            data[i] = 0.02f * static_cast<float>((i % 13) + 1) - 0.1f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, input);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(output_seams.size(), 1u) << "Expected the int4 K-split to set up an all-reduce output";
+    EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(0, input);
+    tp_request.set_input_tensor(1, residual);
+    tp_request.infer();
+    const ov::Tensor tp_output = tp_request.get_output_tensor();
+
+    ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+    ASSERT_EQ(tp_output.get_shape(), (ov::Shape{1, n}));
+    EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999)
+        << "int4 K-split all-reduce output diverged from the single-GPU reference";
+    ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S09] Negative: the number of quantization groups (G = K / group_size) is not divisible by the
+// number of ranks, so the contraction axis cannot be split on group boundaries. The seam stays
+// K_SPLIT (stable classification) but is not sliced (no all-reduce output) and the replicated
+// full computation must still match single-GPU inference.
+TEST_F(TensorParallelCompileGPU, Int4KsplitIndivisibleFallsBackToReplica) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t n = 4096;
+    const size_t k = 1152;  // k / 128 = 9 groups (odd, not divisible by 2 ranks)
+    auto ref_model = make_int4_ksplit_indivisible_model(n, k);
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, k});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < k; ++i) {
+            data[i] = 0.05f * static_cast<float>((i % 7) + 1) - 0.2f;
+        }
+    }
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, n});
+    {
+        auto* data = residual.data<float>();
+        for (size_t i = 0; i < n; ++i) {
+            data[i] = 0.03f * static_cast<float>((i % 5) + 1) - 0.1f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, input);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(seams.size(), 1u);
+    EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    EXPECT_TRUE(output_seams.empty()) << "Indivisible group count must not set up an all-reduce output";
 
     auto tp_request = tp_compiled.create_infer_request();
     tp_request.set_input_tensor(0, input);
