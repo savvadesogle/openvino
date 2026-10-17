@@ -12,7 +12,8 @@
 
 ## Прогресс сессий
 - [x] Планирование (2026-10-17, PLAN.md готов)
-- [ ] S01 init репо
+- [x] Базовая инициализация репо (2026-10-17): remotes origin/upstream, shallow-fetch tip 85720fe2, commit 6339e518 (PLAN/STATE/NEXT/.gitignore) запушен в origin master
+- [ ] S01 init (остаток: ветка feature/gpu-tensor-parallel, docs/notes/*, генерация NEXT.md для S02)
 - [ ] S02 L0-спайк A
 - [ ] S03 L0-спайк B (G0)
 - [ ] S04 Stage1.1 TPCoordinator
