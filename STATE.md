@@ -25,7 +25,7 @@
 - [x] S09 Stage2.4 int4_ASYM (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S10 Stage3.1 per-rank KV + state aggregation (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S11 Stage3.2 linear_attention (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S12 Stage3.3 Hard (dynamic/events/concurrency)
+- [x] S12 Stage3.3 Hard (2026-10-18; код+тест готовы, GATE частичный — сборка недоступна)
 - [ ] S13 Stage4.1 GenAI интеграция
 - [ ] S14 Stage4.2 Scheduler + бенч
 - [ ] S15 Stage5.1 перф
@@ -51,6 +51,8 @@
 
 | 2026-10-17 | S11 Stage3.2 linear_attention | **частично** (код+тест готовы) | **Примитив PLAN §4.3 «depthwise conv per head»**. `TPShardTransform` теперь распознаёт head-local состоятельную цепочку, рекуррентность которой идёт через **depthwise `GroupConvolution`** (`ReadValue -> depthwise GroupConvolution -> (elementwise/broadcast) -> Assign`): depthwise ⇔ filters `[GROUPS,1,1,k]` c `GROUPS == data channels == full_dim` (`match_depthwise_head_conv`, filters — `Constant`); переменная переводится в `HEAD_SHARDED` по канало-оси, а **depthwise-фильтры режутся тем же ранговым диапазоном** (ось 0, `slice_constant`, `replace_constant`) до `validate_nodes_and_infer_types()`. **Ось головы**: `find_state_head_axis` теперь предпочитает **axis 1** (каноничный layout Qwen `[batch, heads, ...]` — KV/conv/ssm), затем `rank-2`, затем первую делимую внутреннюю ось (для старых тестов `[1,4,2]` результат тот же). Любой иной (не-depthwise / не-head-local) `GroupConvolution` в цепочке → `REPLICATED` без throw (прогресс S07–S10). **Инвентарь**: `docs/notes/state-inventory.md` §6 — точные conv-цепочки (`Gather → Concat → GroupConvolution → Slice`), ssm (`Gather → Loop(delta-rule) → Reshape`), head-ось = 1, conv-веса тоже int4_ASYM dequant. **Вывод**: реальные Qwen-цепочки не head-local (coupled fused `in_proj` + `Concat`/`Loop`/`ScatterNDUpdate`) → **REPLICATED**; per-rank Qwen = S12. **Тесты**: `LinearAttentionConvStateHeadShardingMatchesSingleGpu` (heads=4 → `HEAD_SHARDED:1:4:`, multi-step паритет, агрегированное состояние полной формы) и `LinearAttentionConvStateIndivisibleStaysReplicated` (heads=3 → `REPLICATED:`), модель `make_linear_attn_conv_state_model` (depthwise conv same-pad). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры») |
 
+| 2026-10-18 | S12 Stage3.3 Hard (dynamic/transport/concurrency) | **частично** (код+тест готовы) | **Динамические state-шейпы**: `TPStateSeam.full_shape` переведён `ov::Shape`→`ov::PartialShape` (`tp_plan.hpp`); `TPShardTransform::find_state_head_axis` принимает `PartialShape` и требует, чтобы head-ось была **статической и делимой** (`axis.is_static() && get_length()%num_ranks==0`), а `analyze_state_variable` пропускает динамический ранг/динамические внутренние оси (`rank().is_dynamic()` — REPLICATED без throw), вместо прежнего отклонения «dynamic state shape». Шардинг: `sharded[axis]=ov::Dimension(full_dim/num_ranks)` при сохранении динамики batch/seq, затем `update_data_shape(sharded)`+`validate_nodes_and_infer_types()`. Это снимает барьер для всех реальных Qwen-состояний `?,4,?,256`/`?,8192,4`/`?,32,128,128` (но сами они по-прежнему REPLICATED — потребители не head-local, см. S10/S11). **Межранговый транспорт**: новый `TPTransport` (`tp_transport.hpp/.cpp`) — host-USM staging (G0): reusable pinned-host staging-буфер, коллективы `all_gather_axis`/`scatter_axis`/`all_reduce_sum_fp32` (fp32-аккумуляция + «term один раз»), capabilities-probe фиксирует `HOST_STAGING`/peer=false/ipc=false (S02/S03), PEER — только runtime fast-path hook (S15). Перенесённые хелперы (`copy_axis_region`/`extract_axis_region`/`tensor_to_floats`/`floats_to_tensor`/`row_major_strides`/`accumulate_scaled_broadcast`) вынесены из `tp_infer_request.cpp` в транспорт. `assemble_outputs` (all-gather), `assemble_reduce_sum` (all-reduce) и `TPAggregatedState::get_state/set_state` теперь ходят через `m_transport`; форма полного состояния выводится из runtime-slice ранга (`full_shape=slice_shape; full_shape[axis]*=num_ranks`) — поддержка динамических batch/seq. **Конкурентность**: `m_infer_mutex` сериализует `infer()` одного запроса; `m_output_mutex` защищает lazy-аллокацию выходных буферов; независимые запросы изолированы (свои rank sub-запросы+transport+outputs). **Устройство**: device-side события (`zeEventPool`) и true in-graph inter-node коллективы НЕ реализованы (S12-приоритет — корректность/паритет); counter-based event+`zeEventHostSignal`=UNSUPPORTED, classic `zeEventCreate`=краш драйвера (S02) → staging. **Тесты S12** (`tensor_parallel.cpp`): билдер `make_dynamic_stateful_head_model(heads,head_dim)` (Variable `[?,heads,hd]`), `DynamicStateHeadShardingMatchesSingleGpu` (dynamic batch, seam `HEAD_SHARDED:1:4:`, multi-step паритет + агрегированное `[2,4,2]`), `DynamicStateIndivisibleStaysReplicated` (heads=3 → `REPLICATED:`), `StateRoundtripHeadShardedMatchesSingleGpu`, `StateRoundtripReplicatedMatchesSingleGpu`, `ConcurrentRequestsMatchSingleGpu` (2 sync + 2 async запроса). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); S04–S11 не затронуты (TP-off == upstream, форматы seams/state не менялись: `KIND:COLLECTIVE:TYPE:NAME`, `COLLECTIVE:...`, `KIND:AXIS:FULL_DIM:VARIABLE_ID`) |
+
 ## Блокеры / открытые вопросы
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
@@ -60,7 +62,7 @@
   `flatbuffers`, `intel_gpu/thirdparty/onednn_gpu` и др. `git submodule update --init`
   = сетевой fetch (запрещён remote-политикой) и многогигабайтная закачка. Итог: S04 GATE
   подтверждён только статически (ревью кода/сигнатур); сборка/запуск теста — вне сессии.
-  Актуально для S05, S06, S07, S08, S09, S10 и S11: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
+  Актуально для S05, S06, S07, S08, S09, S10, S11 и S12: GATE подтверждён по коду/плану (ревью), прогон `tensor_parallel`
   тестов — вне сессии.
 - **Решено (2026-10-17): remote не используем.** Сессия работает исключительно в
   локальном репозитории `C:\openvino-tp`; на `origin`/`upstream` ничего не пушим и
@@ -69,6 +71,37 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S12 done (частично, 2026-10-18)** — Stage 3.3 Hard: динамические state-шейпы + межранговый транспорт + конкурентность.
+  Артефакты/решения:
+  - **Динамика**: `TPStateSeam.full_shape` = `ov::PartialShape`. `find_state_head_axis(PartialShape)` требует
+    **статическую делимую** head-ось; `analyze_state_variable` допускает динамический batch/seq (раньше — отказ
+    «dynamic state shape»). `sharded[axis] = ov::Dimension(full_dim / num_ranks)`, динамика прочих осей сохраняется;
+    после `update_data_shape` обязателен `validate_nodes_and_infer_types()` (per-pass validation off,
+    `transformations_pipeline.cpp:645`). `full_dim`/`axis`/`variable_id` из `TPStateSeam` не менялись (формат свойства тот же).
+  - **Транспорт**: `TPTransport` (host-USM staging, G0) — единая точка коллективов. `tp_transport_capabilities()`
+    возвращает кэшированный `HOST_STAGING/peer=false/ipc=false` (S02/S03); PEER — fast-path hook для S15 (запрос
+    `zeDeviceCanAccessPeer` уровня плагина), на текущем железе не активен. Коллективы работают только с host-visible
+    `ov::ITensor` (remote → `OPENVINO_ASSERT`), `m_staging` переиспользуется (не аллоцируется на инференс).
+  - **Динамическое состояние + транспорт**: `TPAggregatedState` больше не хранит compile-time full_shape — полная форма
+    выводится из runtime-slice `rank-0` (`slice_shape[axis]*=num_ranks`), `get_state()` — `all_gather_axis`,
+    `set_state()` — `scatter_axis` (per-rank буферы берут форму от входного полного состояния).
+  - **Конкурентность**: `m_infer_mutex` (сериализация `infer()` одного запроса) + `m_output_mutex` (lazy-аллокация
+    выходов). Параллельный запуск per-rank sub-запросов осознанно НЕ делался (детерминированный порядок staging;
+    параллелизм — S14 scheduler). `TPInferRequest` теперь содержит `std::mutex` → копирование/перемещение недоступно
+    (запросы и не копируются).
+  - **Device-side/события**: не реализованы (приоритет S12 — корректность/паритет). Находки S02: counter-based event +
+    `zeEventHostSignal` = UNSUPPORTED; classic `zeEventCreate` из ctypes крашил драйвер → `zeEventPool` использовать
+    осторожно. True in-graph inter-node all-gather/all-reduce (разрезка coupled fused `in_proj`/`Concat`/`Loop`) —
+    не в S12; реальный Qwen по-прежнему преимущественно REPLICATED.
+  - **Тесты**: `make_dynamic_stateful_head_model`, `DynamicStateHeadShardingMatchesSingleGpu`,
+    `DynamicStateIndivisibleStaysReplicated`, `StateRoundtripHeadShardedMatchesSingleGpu`,
+    `StateRoundtripReplicatedMatchesSingleGpu`, `ConcurrentRequestsMatchSingleGpu`. Форматы свойств стабильны.
+  - **Сборка по-прежнему недоступна** (сабмодули пусты) → GATE частичный (код + план теста). Перед S13:
+    при появлении сабмодулей — прогон `tensor_parallel` и Qwen3.5-9B-int4 TP2 vs 1-GPU (seq ~256).
+  - **S13 стартует с**: Stage 4.1 — GenAI интеграция (см. NEXT.md). Точки: `TPCompiledModel` уже отдаёт
+    сериализуемые plan/seams и работает через штатный `ov::InferRequest` API (GenAI/OV-genai использует его напрямую);
+    проверить `model_distribution_policy{TENSOR_PARALLEL}` со стороны GenAI-пайплайна, конфиг `tp` в `LLMPipeline`,
+    поведение stateful-модели и `query_state/set_state` через GenAI.
 - **S11 done (частично, 2026-10-17)** — Stage 3.2 linear_attention. Артефакты/решения:
   - **Примитив «depthwise conv per head» (PLAN §4.3)**: `TPShardTransform::analyze_state_variable` теперь
     обрабатывает `ov::op::v1::GroupConvolution` в цепочке состояния. Распознаётся только **depthwise-форма**

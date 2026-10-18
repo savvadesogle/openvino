@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "openvino/core/partial_shape.hpp"
 #include "openvino/core/shape.hpp"
 #include "openvino/core/type/element_type.hpp"
 
@@ -149,10 +150,12 @@ struct TPStateSeam {
     TPStateShardKind kind = TPStateShardKind::REPLICATED;
     //! Head axis of the FULL state shape (non-negative index); -1 for REPLICATED.
     int64_t axis = -1;
-    //! Size of the head axis in the FULL (unsharded) state; -1 for REPLICATED.
+    //! Size of the head axis in the FULL (unsharded) state; -1 for REPLICATED. Always static
+    //! (S12 head-shards only along a static, rank-divisible axis even when other dims are dynamic).
     int64_t full_dim = -1;
-    //! Full (unsharded) state shape (used to validate/extract per-rank slices).
-    ov::Shape full_shape;
+    //! Full (unsharded) state shape. May carry dynamic dimensions (batch/sequence) as in the real
+    //! Qwen3.5 states (`?,4,?,256`, `?,32,128,128`); only the head axis is guaranteed static (S12).
+    ov::PartialShape full_shape;
     //! Human-readable reason (debug/introspection): why replicated or head-sharded.
     std::string reason;
 };

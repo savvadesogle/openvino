@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05/S07/S08/S09/S10/S11] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08/S09/S10/S11/S12] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -28,7 +28,12 @@
 //      GroupConvolution is head-sharded along the channel (head) axis with the depthwise filters
 //      sliced per rank; chains that mix heads (real Qwen conv/ssm chains via Concat/Loop) stay
 //      replicated.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S11).
+// S12: dynamic state shapes - a partially dynamic state (dynamic batch, static divisible head
+//      axis, the shape of every real Qwen3.5 state) is still head-sharded; the aggregated state
+//      exposes the runtime full shape. Inter-rank collectives are routed through the host-USM
+//      staging transport, and state query/set round-trips + concurrent (sync/async) requests match
+//      single-GPU inference.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S12).
 
 #include <algorithm>
 #include <cmath>
@@ -304,6 +309,33 @@ std::shared_ptr<ov::Model> make_linear_attn_conv_state_model(size_t heads, size_
                                        ov::SinkVector{assign},
                                        ov::ParameterVector{},
                                        "tp_la_conv_state");
+}
+
+// [S12] Partially dynamic, head-shardable recurrent state:
+//   Variable V[?, H, hd] -> ReadValue -> Add(x[?, 1, hd]) -> Assign(V) ; Result(Add)
+// The variable has a dynamic batch axis but a static head axis (axis 1) divisible by the number
+// of ranks, mirroring the real Qwen3.5 states (`?,4,?,256` KV, `?,8192,4` conv, `?,32,128,128`
+// ssm). The ReadValue -> Add(broadcast) -> Assign chain is head-local, so the variable must be
+// HEAD_SHARDED despite the dynamic dimension; a head count not divisible by the ranks must fall
+// back to REPLICATED.
+std::shared_ptr<ov::Model> make_dynamic_stateful_head_model(size_t heads, size_t head_dim) {
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{ov::Dimension::dynamic(),
+                                                    static_cast<int64_t>(heads),
+                                                    static_cast<int64_t>(head_dim)},
+                                   ov::element::f32,
+                                   "tp_dyn_state_var"});
+    auto read_value = std::make_shared<ov::op::v6::ReadValue>(variable);
+    auto x = std::make_shared<ov::op::v0::Parameter>(
+        ov::element::f32,
+        ov::PartialShape{ov::Dimension::dynamic(), 1, static_cast<int64_t>(head_dim)});
+    auto add = std::make_shared<ov::op::v1::Add>(read_value, x);
+    auto assign = std::make_shared<ov::op::v6::Assign>(add, variable);
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    return std::make_shared<ov::Model>(ov::ResultVector{result},
+                                       ov::SinkVector{assign},
+                                       ov::ParameterVector{x},
+                                       "tp_dyn_state_head");
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -1130,6 +1162,260 @@ TEST_F(TensorParallelCompileGPU, LinearAttentionConvStateIndivisibleStaysReplica
     auto tp_states = tp_request.query_state();
     ASSERT_EQ(tp_states.size(), 1u);
     EXPECT_EQ(tp_states[0].get_state().get_shape(), (ov::Shape{1, heads, taps}));
+}
+
+// [S12] GATE: a partially dynamic state variable (dynamic batch, static divisible head axis - the
+// shape of every real Qwen3.5 state: `?,4,?,256` etc.) must be HEAD_SHARDED along the static head
+// axis. Multi-step TP inference with a concrete dynamic batch must match single-GPU inference and
+// the aggregated (full-shape) state must match too.
+TEST_F(TensorParallelCompileGPU, DynamicStateHeadShardingMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    const size_t batch = 2;
+    auto ref_model = make_dynamic_stateful_head_model(heads, head_dim);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    // The dynamic batch must not force replication: head axis 1 (size 4) is static and divisible.
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+    EXPECT_NE(state_seams[0].find(":1:4:"), std::string::npos) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    for (size_t t = 0; t < 4; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{batch, 1, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < batch * head_dim; ++i) {
+            data[i] = 0.2f * static_cast<float>((i + t) % 6) - 0.4f;
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    // Aggregated state exposes the runtime full shape (batch preserved, head axis restored).
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    EXPECT_EQ(tp_states[0].get_state().get_shape(), (ov::Shape{batch, heads, head_dim}));
+    auto ref_states = ref_request.query_state();
+    ASSERT_EQ(ref_states.size(), 1u);
+    ov::test::utils::compare(ref_states[0].get_state(), tp_states[0].get_state(), 1e-4f, 1e-4f);
+}
+
+// [S12] Negative: a dynamic state whose head axis is not divisible by the number of ranks must
+// stay REPLICATED (rank 0 authoritative) and still match single-GPU inference.
+TEST_F(TensorParallelCompileGPU, DynamicStateIndivisibleStaysReplicated) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 3;  // not divisible by 2 ranks
+    const size_t head_dim = 2;
+    auto ref_model = make_dynamic_stateful_head_model(heads, head_dim);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    for (size_t t = 0; t < 3; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < head_dim; ++i) {
+            data[i] = 0.3f * static_cast<float>(t + 1) + static_cast<float>(i);
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_output_tensor();
+        const ov::Tensor tp_output = tp_request.get_output_tensor();
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    EXPECT_EQ(tp_states[0].get_state().get_shape(), (ov::Shape{1, heads, head_dim}));
+}
+
+// [S12] State roundtrip: query_state() -> set_state() -> infer() for a HEAD_SHARDED variable must
+// distribute the full state across ranks (via the staging transport) so a resumed TP request
+// matches a single-GPU request resumed from the same state.
+TEST_F(TensorParallelCompileGPU, StateRoundtripHeadShardedMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_stateful_head_model(heads, head_dim, /*broadcast_input=*/true);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    // Reference resumed from a known full state, and TP resumed by scattering the same state.
+    ov::Tensor seed(ov::element::f32, ov::Shape{1, heads, head_dim});
+    auto* seed_data = seed.data<float>();
+    for (size_t i = 0; i < heads * head_dim; ++i) {
+        seed_data[i] = 0.2f * static_cast<float>(i + 1) - 0.35f;
+    }
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+    ref_request.query_state()[0].set_state(seed);
+    tp_request.query_state()[0].set_state(seed);
+
+    // Roundtrip through query_state(): capture the aggregated TP state and re-apply it.
+    const ov::Tensor captured = tp_request.query_state()[0].get_state();
+    ASSERT_EQ(captured.get_shape(), (ov::Shape{1, heads, head_dim}));
+    tp_request.query_state()[0].set_state(captured);
+
+    for (size_t t = 0; t < 3; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < head_dim; ++i) {
+            data[i] = 0.1f * static_cast<float>(t + 1) - static_cast<float>(i);
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        ov::test::utils::compare(ref_request.get_output_tensor(), tp_request.get_output_tensor(), 1e-4f, 1e-4f);
+    }
+}
+
+// [S12] State roundtrip for a REPLICATED variable: set_state() fans the full state out to every
+// rank and a resumed TP request matches single-GPU inference.
+TEST_F(TensorParallelCompileGPU, StateRoundtripReplicatedMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_stateful_head_model(heads, head_dim, /*broadcast_input=*/false);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    ov::Tensor seed(ov::element::f32, ov::Shape{1, heads, head_dim});
+    auto* seed_data = seed.data<float>();
+    for (size_t i = 0; i < heads * head_dim; ++i) {
+        seed_data[i] = 0.15f * static_cast<float>(i + 1) - 0.25f;
+    }
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+    ref_request.query_state()[0].set_state(seed);
+    tp_request.query_state()[0].set_state(seed);
+
+    for (size_t t = 0; t < 3; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, heads, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < heads * head_dim; ++i) {
+            data[i] = 0.1f * static_cast<float>((i + t) % 7) - 0.3f;
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        ov::test::utils::compare(ref_request.get_output_tensor(), tp_request.get_output_tensor(), 1e-4f, 1e-4f);
+    }
+}
+
+// [S12] Concurrency: several independent TP requests (sync and async) with different inputs must
+// each match their single-GPU reference. This exercises the per-request isolation of the input
+// replication / output assembly / transport buffers under the async executor.
+TEST_F(TensorParallelCompileGPU, ConcurrentRequestsMatchSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_mlp_nsplit_model();
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    const size_t k = 2;
+    std::vector<ov::Tensor> inputs;
+    std::vector<ov::Tensor> ref_outputs;
+    for (size_t n = 0; n < k; ++n) {
+        ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = 0.1f * static_cast<float>(i + 1) * static_cast<float>(n + 1) - 0.5f;
+        }
+        auto ref_request = ref_compiled.create_infer_request();
+        ref_request.set_input_tensor(input);
+        ref_request.infer();
+        inputs.push_back(input);
+        ref_outputs.push_back(ref_request.get_output_tensor());
+    }
+
+    // Two independent synchronous requests.
+    {
+        auto r0 = tp_compiled.create_infer_request();
+        auto r1 = tp_compiled.create_infer_request();
+        r0.set_input_tensor(inputs[0]);
+        r1.set_input_tensor(inputs[1]);
+        r0.infer();
+        r1.infer();
+        ov::test::utils::compare(ref_outputs[0], r0.get_output_tensor(), 1e-3f, 1e-3f);
+        ov::test::utils::compare(ref_outputs[1], r1.get_output_tensor(), 1e-3f, 1e-3f);
+    }
+
+    // Two overlapping asynchronous requests.
+    {
+        auto r0 = tp_compiled.create_infer_request();
+        auto r1 = tp_compiled.create_infer_request();
+        r0.set_input_tensor(inputs[0]);
+        r1.set_input_tensor(inputs[1]);
+        r0.start_async();
+        r1.start_async();
+        r0.wait();
+        r1.wait();
+        ov::test::utils::compare(ref_outputs[0], r0.get_output_tensor(), 1e-3f, 1e-3f);
+        ov::test::utils::compare(ref_outputs[1], r1.get_output_tensor(), 1e-3f, 1e-3f);
+    }
 }
 
 }  // namespace

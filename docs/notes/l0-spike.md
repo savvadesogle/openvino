@@ -251,3 +251,24 @@ end-to-end** на 16–128 MB; на малых размерах доминиру
 недоступен (S03). ⇒ **G0: дефолт коллективов TP = host-USM staging**;
 peer-путь проектируется как runtime-detect fast-path (`zeDeviceCanAccessPeer`),
 но на этой конфигурации он неактивен.
+
+## 9. Применение G0 в TP-транспорте (S12)
+
+S12 вводит `TPTransport` (`src/plugins/intel_gpu/src/plugin/tp/tp_transport.cpp`) — единственную точку
+межранговых коллективов TP, реализующую G0:
+
+- **Вселенная тензоров**: коллективы принимают только host-visible `ov::ITensor`; device/remote-тензоры
+  отклоняются (`OPENVINO_ASSERT`). Per-rank sub-запросы GPU-плагина отдают host-тензоры (I/O по умолчанию
+  host-visible), так что граница совпадает с G0-контрактом.
+- **Kinds**: `TPTransportKind::HOST_STAGING` (дефолт, работает везде) и `PEER` (runtime fast-path hook,
+  на 2× A770 неактивен — `tp_transport_capabilities()` кэширует `peer_available=false`, `ipc_available=false`).
+- **Коллективы**: `all_gather_axis` (конкатенация per-rank регионов по оси), `scatter_axis` (обратное —
+  раздача полного состояния на шарды), `all_reduce_sum_fp32` (fp32-сумма частичных + «term один раз» для
+  replicated bias/residual, PLAN §4.3/§7.4). Owned `m_staging` переиспользуется (без аллокации на инференс).
+- **Почему не device-side события**: S02/S03 показали, что counter-based event + `zeEventHostSignal` =
+  UNSUPPORTED на этой платформе, а classic `zeEventCreate` из ctypes крашил драйвер; `zeEventPool` —
+  единственный безопасный путь, но требует уровня драйвера GPU-плагина. S12 сознательно ограничен корректностью
+  (host-sync на границе), device-side fast-path — S15 (перф), true in-graph inter-node коллективы — вне S12.
+- **Атомарность/перф**: коллективы на хосте дают ~4–5 GB/s e2e (см. §8.3); для реального Qwen это означает, что
+  полный per-rank шардинг при N>1 экономически оправдан только при перф-профиле S15, а не в S12 (приоритет —
+  корректность/паритет).

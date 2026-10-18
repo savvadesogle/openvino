@@ -23,6 +23,9 @@
 // that runs through a depthwise GroupConvolution (constant filters [GROUPS,1,1,k], GROUPS ==
 // data channels) is head-sharded along the channel/head axis and the depthwise filters are
 // sliced by the same rank range. Chains that mix heads stay replicated.
+// S12 allows partially dynamic state shapes (Qwen `?,4,?,256` / `?,32,128,128`): only the head
+// axis must be a static, rank-divisible dimension, so dynamic batch/sequence dims no longer force
+// replication; the sharded variable keeps the dynamic dims untouched.
 // See PLAN.md §4.2, §4.3, §7.4.
 
 #pragma once

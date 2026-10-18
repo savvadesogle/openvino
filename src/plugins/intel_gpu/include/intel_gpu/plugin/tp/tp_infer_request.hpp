@@ -1,19 +1,22 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05/S07/S08/S10] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S07/S08/S10/S12] Experimental GPU tensor-parallel support.
 // TPInferRequest drives k per-rank inference requests (one per device): inputs are replicated
 // to every rank, only rank-0 outputs are exposed. S07 assembles N-split outputs (all-gather
 // equivalent, concatenation); S08 sums K-split outputs (all-reduce sum) with fp32 accumulation
 // and adds replicated bias/residual terms exactly once. S10 aggregates model state variables
 // across ranks: head-sharded variables are concatenated along their head axis on query_state()
 // (and scattered on set_state()); replicated variables are rank-0 authoritative.
+// S12 routes the collectives through TPTransport (host-USM staging, G0), aggregates state by
+// runtime shape (dynamic batch/seq), and serializes inference per request for async/multi-request.
 // See PLAN.md §4.3, §4.4, §7.4.
 
 #pragma once
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "intel_gpu/plugin/tp/tp_plan.hpp"
@@ -23,6 +26,7 @@
 namespace ov::intel_gpu {
 
 class TPCompiledModel;
+class TPTransport;
 
 /**
  * @brief Synchronous inference request for a tensor-parallel compiled model.
@@ -66,14 +70,29 @@ private:
 
     // [S08] Sums the per-rank partial GEMM outputs in fp32 (all-reduce sum) and applies the
     // output seam's replicated additive terms exactly once.
-    void assemble_reduce_sum(size_t output_index, const TPOutputSeam& seam);
+    void assemble_reduce_sum(size_t output_index, const TPOutputSeam& seam, ov::SoPtr<ov::ITensor>& dst);
 
-    // Lazily allocates the host output tensor exposed for port @p index (full shape).
+    // Lazily allocates the host output tensor exposed for port @p index using the static declared
+    // port shape (used by the public get/set_tensor path).
     ov::SoPtr<ov::ITensor>& output_tensor(size_t index) const;
 
+    // [S12] Returns the assembled-output buffer @p index, (re)allocating it to the runtime
+    // @p shape / @p element_type when needed. Handles dynamic (batch/seq) outputs that the static
+    // declared port shape cannot describe.
+    ov::SoPtr<ov::ITensor>& ensure_output(size_t index,
+                                          const ov::Shape& shape,
+                                          const ov::element::Type& element_type) const;
+
     std::vector<ov::SoPtr<ov::ISyncInferRequest>> m_rank_requests;
+    // [S12] Inter-rank collective transport (host-USM staging). Owns the reusable staging buffer
+    // and is shared with the state aggregators returned by query_state().
+    std::shared_ptr<TPTransport> m_transport;
     // Owned outputs, indexed by model output index (one entry per output port).
     mutable std::vector<ov::SoPtr<ov::ITensor>> m_output_tensors;
+    // Serializes inference on this request (separate requests are independent; a single request is
+    // not re-entrant). Guards the mutable output buffers against concurrent allocation.
+    std::mutex m_infer_mutex;
+    mutable std::mutex m_output_mutex;
 };
 
 }  // namespace ov::intel_gpu

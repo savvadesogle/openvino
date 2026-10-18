@@ -33,6 +33,10 @@
 //    (axis 1 = heads for KV, conv channels and the ssm state). Chains that mix heads (the real
 //    Qwen conv/ssm chains go through Concat/Loop with full-width coupled projections) stay
 //    REPLICATED. See PLAN §4.3/§5 (S11).
+//  - S12: dynamic (partially-shaped) state variables (`?,4,?,256` KV, `?,8192,4` conv,
+//    `?,32,128,128` ssm) are head-sharded along their static, rank-divisible head axis; dynamic
+//    batch/sequence dimensions are preserved. The head axis is required to be static, so a state
+//    whose only divisible axis is dynamic stays REPLICATED. See PLAN §4.3/§5 (S12).
 // See PLAN.md §2, §4.2, §4.3, §7.4.
 
 #include "tp_shard_transform.hpp"
@@ -876,16 +880,23 @@ bool apply_ksplit_quantized(const QuantizedWeight& qw, int64_t offset_g, int64_t
 //! ([batch, heads, ...]): the full-attention KV cache ([batch, kv_heads, seq, head_dim]), the
 //! linear-attention depthwise conv state ([batch, channels, kernel] with channels = heads * d)
 //! and the delta-rule ssm state ([batch, heads, key, value]). Axis 1 is therefore preferred when
-//! it is a divisible interior axis; otherwise the axis adjacent to the innermost one (per-head
-//! [.., H, hd]) and finally the first divisible interior axis. Returns -1 when no divisible
-//! interior axis exists. See docs/notes/state-inventory.md.
-int64_t find_state_head_axis(const ov::Shape& shape, int32_t num_ranks) {
-    const int64_t rank = static_cast<int64_t>(shape.size());
+//! it is a static, divisible interior axis; otherwise the axis adjacent to the innermost one
+//! (per-head [.., H, hd]) and finally the first static, divisible interior axis. Returns -1 when
+//! no such interior axis exists. [S12] Accepts a PartialShape so that states with dynamic batch /
+//! sequence dimensions (`?,4,?,256`, `?,32,128,128`) can still be head-sharded along their static
+//! head axis. See docs/notes/state-inventory.md.
+int64_t find_state_head_axis(const ov::PartialShape& shape, int32_t num_ranks) {
+    if (shape.rank().is_dynamic()) {
+        return -1;
+    }
+    const int64_t rank = shape.rank().get_length();
     if (rank < 2 || num_ranks <= 1) {
         return -1;
     }
     auto divisible = [&](int64_t a) {
-        return a >= 1 && a <= rank - 2 && shape[a] > 1 && (shape[a] % static_cast<size_t>(num_ranks) == 0);
+        const auto& dim = shape[a];
+        return a >= 1 && a <= rank - 2 && dim.is_static() && dim.get_length() > 1 &&
+               (dim.get_length() % num_ranks == 0);
     };
     if (divisible(1)) {
         return 1;
@@ -964,7 +975,7 @@ struct StateShardAnalysis {
     bool safe = false;
     int64_t axis = -1;
     int64_t full_dim = -1;
-    ov::Shape full_shape;
+    ov::PartialShape full_shape;
     std::vector<size_t> derived_results;  // model output indices reachable via element-wise ops
     //! [S11] depthwise conv weights reachable from the state chain that must be sliced per rank
     //! (the "depthwise conv per head" primitive, PLAN §4.3).
@@ -992,8 +1003,13 @@ StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Va
                                           int32_t num_ranks) {
     StateShardAnalysis a;
     const auto info = var->get_info();
-    if (!info.data_shape.is_static()) {
-        a.reason = "dynamic state shape";
+    // [S12] The state rank must be static (the head axis is identified positionally), but the
+    // individual dimensions may be dynamic: the real Qwen3.5 states are all partially dynamic
+    // (`?,4,?,256` KV, `?,8192,4` conv, `?,32,128,128` ssm). Only the head axis needs to be a
+    // static dimension divisible by the number of ranks, so dynamic batch/sequence dimensions no
+    // longer force replication.
+    if (info.data_shape.rank().is_dynamic()) {
+        a.reason = "dynamic state rank";
         return a;
     }
     if (info.data_type.is_dynamic() || info.data_type == ov::element::string ||
@@ -1001,13 +1017,13 @@ StateShardAnalysis analyze_state_variable(const std::shared_ptr<ov::op::util::Va
         a.reason = "non-numeric state type";
         return a;
     }
-    a.full_shape = info.data_shape.to_shape();
+    a.full_shape = info.data_shape;
     a.axis = find_state_head_axis(a.full_shape, num_ranks);
     if (a.axis < 0) {
-        a.reason = "head axis not divisible by num_ranks";
+        a.reason = "no static head axis divisible by num_ranks";
         return a;
     }
-    a.full_dim = static_cast<int64_t>(a.full_shape[a.axis]);
+    a.full_dim = static_cast<int64_t>(a.full_shape[a.axis].get_length());
 
     // A ReadValue may carry an initialization subgraph; its value must broadcast along the head
     // axis so the (sharded) variable shape still relaxes it. Otherwise the state stays replicated.
@@ -1444,14 +1460,16 @@ bool TPShardTransform::run_on_model(const std::shared_ptr<ov::Model>& model) {
                                << std::endl;
             }
             auto sharded = analysis.full_shape;
-            sharded[analysis.axis] = sharded[analysis.axis] / static_cast<size_t>(m_num_ranks);
-            g.var->update_data_shape(ov::PartialShape(sharded));
+            // The head axis is static (guaranteed by find_state_head_axis); only this dimension is
+            // reduced, dynamic batch/sequence dimensions are preserved as-is (S12).
+            sharded[analysis.axis] = ov::Dimension(analysis.full_dim / m_num_ranks);
+            g.var->update_data_shape(sharded);
             for (size_t oi : analysis.derived_results) {
                 StateOutputSeam so;
                 so.output_index = oi;
                 so.axis = analysis.axis;
                 so.full_dim = analysis.full_dim;
-                so.full_rank = static_cast<int64_t>(analysis.full_shape.size());
+                so.full_rank = static_cast<int64_t>(analysis.full_shape.rank().get_length());
                 so.variable_id = id;
                 state_output_seams.push_back(std::move(so));
             }
