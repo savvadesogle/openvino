@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S06/S07/S08/S10] Experimental GPU tensor-parallel support.
+// [TP-GPU, S04/S06/S07/S08/S10/S16] Experimental GPU tensor-parallel support.
 // Minimal tensor-parallel plan produced at compile time by the TPCoordinator.
 // S06 adds seam detection: TPShardTransform classifies MatMul/FullyConnected nodes and the
 // coordinator collects them into TPPlan.seams. S07 adds N-split weight slicing + all-gather
@@ -26,6 +26,11 @@
 namespace ov {
 class Model;
 }  // namespace ov
+
+namespace cldnn {
+class BinaryOutputBuffer;
+class BinaryInputBuffer;
+}  // namespace cldnn
 
 namespace ov::intel_gpu {
 
@@ -226,5 +231,16 @@ std::vector<TPOutputSeam> get_tp_output_seams(const std::shared_ptr<const ov::Mo
 void set_tp_state_seams(const std::shared_ptr<ov::Model>& model, std::vector<TPStateSeam> seams);
 //! [S10] Reads the state-variable sharding previously stored by TPShardTransform (empty if none).
 std::vector<TPStateSeam> get_tp_state_seams(const std::shared_ptr<const ov::Model>& model);
+
+//! [S16] Magic/version of the per-rank tensor-parallel compiled-model cache envelope.
+//! The envelope wraps one independently exported single-device blob per rank plus the TPPlan, so
+//! the ranks of a TP group never share a blob (see TPCompiledModel::export_model).
+constexpr uint32_t TENSOR_PARALLEL_BLOB_MAGIC = 0x54505342u;  //!< "TPSB"
+constexpr uint32_t TENSOR_PARALLEL_BLOB_VERSION = 1u;
+
+//! [S16] Serializes the tensor-parallel plan into the compiled-model cache envelope.
+void save_tp_plan(cldnn::BinaryOutputBuffer& ob, const TPPlan& plan);
+//! [S16] Deserializes a tensor-parallel plan previously written by save_tp_plan.
+void load_tp_plan(cldnn::BinaryInputBuffer& ib, TPPlan& plan);
 
 }  // namespace ov::intel_gpu

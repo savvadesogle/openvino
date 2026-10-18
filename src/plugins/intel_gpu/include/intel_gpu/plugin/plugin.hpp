@@ -51,6 +51,19 @@ private:
     std::shared_ptr<ov::ICompiledModel> compile_model_tensor_parallel(const std::shared_ptr<const ov::Model>& model,
                                                                       const ov::AnyMap& orig_config) const;
 
+    // [TP-GPU, S16] Imports the per-rank envelope produced by TPCompiledModel::export_model: one
+    // independent single-device blob per rank, each reconstructed on its own device context. Keeps
+    // the ranks of a TP group from sharing a compiled blob.
+    std::shared_ptr<ov::ICompiledModel> import_model_tensor_parallel(std::istream& model,
+                                                                     const ov::AnyMap& orig_config) const;
+    // [TP-GPU, S16] Imports a single-device blob (the ordinary GPU cache path). Factored out so the
+    // tensor-parallel import can reuse it per rank; behaviour for the non-TP path is unchanged.
+    std::shared_ptr<ov::ICompiledModel> import_single_device_model(std::istream& model,
+                                                                   const std::shared_ptr<RemoteContextImpl>& context_impl,
+                                                                   ExecutionConfig& config,
+                                                                   bool loaded_from_cache,
+                                                                   const size_t* tensor_base) const;
+
     std::vector<ov::PropertyName> get_caching_properties() const;
     std::vector<ov::PropertyName> get_supported_properties() const;
     std::vector<ov::PropertyName> get_supported_internal_properties() const;

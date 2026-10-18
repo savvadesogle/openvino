@@ -44,13 +44,18 @@
 //      PEER transport when available (host-USM staging otherwise, as on 2x A770), and the
 //      all-reduce uses a ring reduce-scatter + all-gather (still fp32, replicated terms once).
 //      The ring must stay deterministic across repeated inference and keep matching single-GPU.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S15).
+// S16: per-rank blob cache - a TP compiled model is exported as one envelope holding an
+//      independent single-device blob per rank plus the TPPlan. Export/import must preserve the
+//      rank table, seams and numbers, and each rank must be reconstructed on its own device
+//      (no rank reuses another rank's sliced-weight blob).
+// See PLAN.md �4.1, �4.2, �4.3, �4.4, �5, �7.4 (S04-S16).
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <numeric>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -1705,6 +1710,208 @@ TEST_F(TensorParallelCompileGPU, GenAiStyleStatefulRoundtripMatchesSingleGpu) {
     ref_request.infer();
     tp_request.infer();
     ov::test::utils::compare(ref_request.get_tensor("logits"), tp_request.get_tensor("logits"), 1e-4f, 1e-4f);
+}
+
+// [S16] GATE: exporting a tensor-parallel compiled model and re-importing it must rebuild a
+// working TP group - the rank table and seam list survive the roundtrip and inference still matches
+// single-GPU. This exercises the per-rank envelope (plan + one independent single-device blob per
+// rank); a naive single-device import would collapse both ranks onto one device.
+TEST_F(TensorParallelCompileGPU, S16ExportImportRoundtripMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_tp_parity_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) - 3.5f;
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(input);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
+
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+
+    std::stringstream blob;
+    OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
+    ASSERT_GT(blob.str().size(), 0u);
+
+    std::stringstream in(blob.str());
+    ov::CompiledModel imported;
+    OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
+    ASSERT_NE(imported, nullptr);
+
+    // Rank table and seams must be restored verbatim from the envelope plan.
+    const auto ranks = imported.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    EXPECT_EQ(ranks, (std::vector<int32_t>{0, 1}));
+    const auto seams_after = imported.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    EXPECT_EQ(seams_before, seams_after);
+
+    auto req = imported.create_infer_request();
+    req.set_input_tensor(input);
+    req.infer();
+    ASSERT_EQ(ref_output.get_shape(), req.get_output_tensor().get_shape());
+    ov::test::utils::compare(ref_output, req.get_output_tensor(), 1e-4f, 1e-4f);
+}
+
+// [S16] Same roundtrip for a K_SPLIT (all-reduce) model with an extra replicated input: the
+// re-imported group must reproduce the reducer's replicated-term handling (residual/bias added once).
+TEST_F(TensorParallelCompileGPU, S16ExportImportKsplitRoundtripMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_ksplit_residual_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor x(ov::element::f32, ov::Shape{1, 8});
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, 16});
+    for (size_t i = 0; i < 8; ++i) {
+        x.data<float>()[i] = 0.3f * static_cast<float>(i + 1) - 1.1f;
+    }
+    for (size_t i = 0; i < 16; ++i) {
+        residual.data<float>()[i] = 0.2f * static_cast<float>((i % 5) + 1) - 0.4f;
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, x);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+
+    std::stringstream blob;
+    OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
+
+    std::stringstream in(blob.str());
+    ov::CompiledModel imported;
+    OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
+
+    EXPECT_EQ(imported.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>(), seams_before);
+
+    auto req = imported.create_infer_request();
+    req.set_input_tensor(0, x);
+    req.set_input_tensor(1, residual);
+    req.infer();
+    ASSERT_EQ(req.get_output_tensor().get_shape(), (ov::Shape{1, 16}));
+    ov::test::utils::compare(ref_output, req.get_output_tensor(), 1e-3f, 1e-3f);
+}
+
+// [S16] A stateful (head-sharded) model must survive the cache roundtrip: the re-imported group
+// still aggregates query_state() across ranks and a resumed request matches single-GPU inference.
+TEST_F(TensorParallelCompileGPU, S16ExportImportStatefulRoundtripMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_stateful_head_model(heads, head_dim, /*broadcast_input=*/true);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
+
+    std::stringstream blob;
+    OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
+
+    std::stringstream in(blob.str());
+    ov::CompiledModel imported;
+    OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
+
+    // The state seam (variable sharding) must have been restored with the plan.
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    const auto seams_after = imported.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    EXPECT_EQ(seams_before, seams_after);
+
+    ov::Tensor seed(ov::element::f32, ov::Shape{1, heads, head_dim});
+    for (size_t i = 0; i < heads * head_dim; ++i) {
+        seed.data<float>()[i] = 0.2f * static_cast<float>(i + 1) - 0.35f;
+    }
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = imported.create_infer_request();
+    ref_request.query_state()[0].set_state(seed);
+    tp_request.query_state()[0].set_state(seed);
+
+    // query_state() must expose the aggregated full state even after the roundtrip.
+    const ov::Tensor captured = tp_request.query_state()[0].get_state();
+    ASSERT_EQ(captured.get_shape(), (ov::Shape{1, heads, head_dim}));
+
+    for (size_t t = 0; t < 3; ++t) {
+        ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+        for (size_t i = 0; i < head_dim; ++i) {
+            x.data<float>()[i] = 0.1f * static_cast<float>(t + 1) - static_cast<float>(i);
+        }
+        ref_request.set_input_tensor(x);
+        tp_request.set_input_tensor(x);
+        ref_request.infer();
+        tp_request.infer();
+        ov::test::utils::compare(ref_request.get_output_tensor(), tp_request.get_output_tensor(), 1e-4f, 1e-4f);
+    }
+}
+
+// [S16] Guard: importing a tensor-parallel envelope *without* the TP policy must fail rather than
+// silently building a single-device model from the first 4 bytes of the envelope magic.
+TEST_F(TensorParallelCompileGPU, S16ImportWithoutTpPolicyIsRejected) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto tp_model = make_tp_parity_model();
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
+
+    std::stringstream blob;
+    OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
+
+    std::stringstream in(blob.str());
+    EXPECT_THROW(core.import_model(in, ov::test::utils::DEVICE_GPU), ov::Exception);
+}
+
+// [S16] Guard (the inverse): a plain single-device blob imported with the TP policy must be
+// rejected because it lacks the tensor-parallel magic - never silently reinterpreted as ranks.
+TEST_F(TensorParallelCompileGPU, S16ImportForeignSingleDeviceBlobIsRejected) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto single_model = make_tp_parity_model();
+    auto single_compiled = core.compile_model(single_model, ov::test::utils::DEVICE_GPU);
+
+    std::stringstream blob;
+    OV_ASSERT_NO_THROW(single_compiled.export_model(blob));
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
+
+    std::stringstream in(blob.str());
+    EXPECT_THROW(core.import_model(in, ov::test::utils::DEVICE_GPU, props), ov::Exception);
 }
 
 }  // namespace

@@ -10,16 +10,20 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <vector>
 
 #include "common_utils/parallel_mem_streambuf.hpp"
+#include "intel_gpu/graph/serialization/binary_buffer.hpp"
 #include "intel_gpu/graph/serialization/layout_serializer.hpp"
 #include "intel_gpu/graph/serialization/string_serializer.hpp"
 #include "intel_gpu/graph/serialization/utils.hpp"
 #include "intel_gpu/graph/serialization/vector_serializer.hpp"
 #include "intel_gpu/plugin/compiled_model.hpp"
+#include "intel_gpu/plugin/tp/tp_compiled_model.hpp"
+#include "intel_gpu/plugin/tp/tp_plan.hpp"
 #include "intel_gpu/plugin/transformations_pipeline.hpp"
 #include "intel_gpu/runtime/debug_configuration.hpp"
 #include "intel_gpu/runtime/device_query.hpp"
@@ -473,13 +477,28 @@ std::shared_ptr<ov::ICompiledModel> Plugin::import_model(std::istream& model,
     ExecutionConfig config = m_configs_map.at(device_id);
     config.set_user_property(_orig_config, OptionVisibility::RELEASE);
 
+    // [TP-GPU, S16] A tensor-parallel compile writes a per-rank envelope instead of a single-device
+    // blob; importing it as one CompiledModel would bind every rank's sliced weights to a single
+    // device. Route it through the TP-aware importer (which reconstructs each rank separately).
+    if (is_tensor_parallel_requested(config)) {
+        return import_model_tensor_parallel(model, _orig_config);
+    }
+
+    return import_single_device_model(model, context_impl, config, loaded_from_cache, g_current_tensor_base);
+}
+
+std::shared_ptr<ov::ICompiledModel> Plugin::import_single_device_model(std::istream& model,
+                                                                       const std::shared_ptr<RemoteContextImpl>& context_impl,
+                                                                       ExecutionConfig& config,
+                                                                       bool loaded_from_cache,
+                                                                       const size_t* tensor_base) const {
     ov::CacheMode cache_mode = config.get_cache_mode();
     ov::EncryptionCallbacks encryption_callbacks = config.get_cache_encryption_callbacks();
 
     std::unique_ptr<cldnn::BinaryInputBuffer> ib_ptr =
         encryption_callbacks.decrypt
             ? std::make_unique<cldnn::EncryptedBinaryInputBuffer>(model, context_impl->get_engine(), encryption_callbacks.decrypt)
-            : std::make_unique<cldnn::BinaryInputBuffer>(model, context_impl->get_engine(), g_current_tensor_base);
+            : std::make_unique<cldnn::BinaryInputBuffer>(model, context_impl->get_engine(), tensor_base);
     auto& ib = *ib_ptr;
 
     ov::CacheMode loaded_cache_mode = ov::CacheMode::OPTIMIZE_SPEED;
@@ -511,6 +530,81 @@ std::shared_ptr<ov::ICompiledModel> Plugin::import_model(std::istream& model,
     }
 
     return std::make_shared<CompiledModel>(ib, shared_from_this(), context_impl, config, loaded_from_cache);
+}
+
+// [TP-GPU, S16] Imports the per-rank envelope written by TPCompiledModel::export_model. Each rank is
+// deserialized with its own device engine/context and its own ExecutionConfig (including the
+// tp_rank coordinate), so a rank can never reuse another rank's blob. The plan (seams / output
+// seams / state seams) is restored verbatim so output assembly and state aggregation behave exactly
+// as in the freshly compiled model.
+std::shared_ptr<ov::ICompiledModel> Plugin::import_model_tensor_parallel(std::istream& model,
+                                                                         const ov::AnyMap& orig_config) const {
+    OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "Plugin::ImportNetwork::TensorParallel");
+    OPENVINO_ASSERT(m_device_map.size() >= 2,
+                    "[GPU][TP] Importing a tensor-parallel compiled model requires at least 2 Intel GPUs, but only ",
+                    m_device_map.size(),
+                    " available");
+
+    // The envelope itself is not device-specific (magic/version/sizes + plan); read it with any
+    // available engine. The per-rank blobs are each re-bound to their own device engine below.
+    auto probe_context = get_default_context(m_default_device_id);
+    cldnn::BinaryInputBuffer ib(model, probe_context->get_engine());
+
+    uint32_t magic = 0;
+    ib >> magic;
+    OPENVINO_ASSERT(magic == TENSOR_PARALLEL_BLOB_MAGIC,
+                    "[GPU][TP] Cannot import compiled blob: missing tensor-parallel magic "
+                    "(the blob was not produced by a tensor-parallel compile).");
+    uint32_t version = 0;
+    ib >> version;
+    OPENVINO_ASSERT(version == TENSOR_PARALLEL_BLOB_VERSION,
+                    "[GPU][TP] Unsupported tensor-parallel blob version ", version,
+                    " (expected ", TENSOR_PARALLEL_BLOB_VERSION, ").");
+    uint64_t num_ranks = 0;
+    ib >> num_ranks;
+    OPENVINO_ASSERT(num_ranks >= 2, "[GPU][TP] Tensor-parallel blob declares ", num_ranks, " ranks");
+
+    TPPlan plan;
+    load_tp_plan(ib, plan);
+    OPENVINO_ASSERT(plan.ranks.size() == num_ranks,
+                    "[GPU][TP] Tensor-parallel blob plan rank count (", plan.ranks.size(),
+                    ") does not match the declared rank count (", num_ranks, ")");
+    OPENVINO_ASSERT(plan.rank_device_ids.size() == num_ranks,
+                    "[GPU][TP] Tensor-parallel blob is missing per-rank device ids");
+
+    std::vector<std::shared_ptr<CompiledModel>> rank_models;
+    rank_models.reserve(num_ranks);
+    for (uint64_t r = 0; r < num_ranks; ++r) {
+        uint64_t blob_size = 0;
+        ib >> blob_size;
+        std::string rank_blob(blob_size, '\0');
+        if (blob_size > 0) {
+            ib >> cldnn::make_data(rank_blob.data(), blob_size);
+        }
+
+        const std::string& rank_device_id = plan.rank_device_ids[r];
+        OPENVINO_ASSERT(m_configs_map.find(rank_device_id) != m_configs_map.end(),
+                        "[GPU][TP] Tensor-parallel blob references unknown device id \"", rank_device_id, "\"");
+        auto rank_context = get_default_context(rank_device_id);
+
+        ExecutionConfig rank_config = m_configs_map.at(rank_device_id);
+        rank_config.set_user_property(orig_config, OptionVisibility::RELEASE);
+        // Stamp the per-rank coordinate exactly as in the compile path so any downstream consumer
+        // observes a consistent config (the finalized graph already carries the sliced weights).
+        ov::AnyMap tp_props;
+        tp_props[ov::intel_gpu::tp_rank.name()] = ov::Any(static_cast<int32_t>(r));
+        tp_props[ov::intel_gpu::tp_num_ranks.name()] = ov::Any(static_cast<int32_t>(num_ranks));
+        rank_config.set_property(tp_props);
+
+        std::istringstream rank_stream(rank_blob);
+        auto rank_model = import_single_device_model(rank_stream, rank_context, rank_config, /*loaded_from_cache=*/true, nullptr);
+        OPENVINO_ASSERT(rank_model != nullptr,
+                        "[GPU][TP] Failed to import tensor-parallel rank ", r, " from the cache blob");
+        rank_models.push_back(std::dynamic_pointer_cast<CompiledModel>(rank_model));
+        OPENVINO_ASSERT(rank_models.back() != nullptr, "[GPU][TP] Imported rank model has an unexpected type");
+    }
+
+    return std::make_shared<TPCompiledModel>(shared_from_this(), std::move(rank_models), std::move(plan));
 }
 
 std::shared_ptr<ov::ICompiledModel> Plugin::import_model(const ov::Tensor& model,

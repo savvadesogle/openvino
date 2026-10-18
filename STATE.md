@@ -29,7 +29,7 @@
 - [x] S13 Stage4.1 GenAI интеграция (2026-10-18; обвязка+тесты+док, GATE частичный — сборка/GenAI/2 GPU недоступны)
 - [x] S14 Stage4.2 Scheduler + бенч (2026-10-18; scheduler+тесты+бенч-харнесс+бенч-план, GATE частичный — сборка/2 GPU недоступны)
 - [x] S15 Stage5.1 перф (2026-10-18; peer-probe+ring allreduce+perf-отчёт, GATE частичный — сборка/2 GPU недоступны)
-- [ ] S16 Stage5.2 стабилизация
+- [x] S16 Stage5.2 стабилизация (2026-10-18; per-rank blob-cache+финальные доки+upstream-серия, GATE частичный — сборка/2 GPU недоступны) — **проект завершён**
 
 ## Гейт-решения (журнал)
 | Дата | Гейт | Решение | Обоснование |
@@ -55,9 +55,17 @@
 
 | 2026-10-18 | S14 Stage4.2 Scheduler + бенч | **частично** (scheduler+тесты+бенч-план; перф-прогон недоступен) | **Rank scheduler (ядро)**: новый `TPInferRequest::schedule_ranks()` (`tp_infer_request.cpp`) исполняет k per-rank sub-запросов **параллельно** на общем k-stream `ov::threading::IStreamsExecutor` (подход **(б)**), созданном в `TPCompiledModel` (`m_rank_executor`, один stream на ранг/устройство). Диспетчер — `ITaskExecutor::run_and_wait(tasks)` (тот же приём, что у `ov::IAsyncInferRequest`, `iasync_infer_request.cpp:29`): пул переживает запрос (нет потоков на инференс — важно для decode), исключения рангов агрегируются через packaged_task/future. Порядок: `replicate_inputs()` (до fan-out) → `schedule_ranks()` (ждём ВСЕ ранги) → `assemble_outputs()` (одним потоком, детерминированно). `m_infer_mutex` сохранён (не-реентерабельность одного запроса); независимые запросы изолированы. Fallback на serial-цикл при отсутствии executor/1 ранге. **Тест** `SchedulerParallelRanksMatchSingleGpu` (4 перекрывающихся async-запроса на N-split/all-gather модели + повторный sync-infer → бит-идентичный выход = нет гонок staging). **Бенч-обвязка**: `tools/tp_bench/tp_bench.py` (TTFT/TPOT TP1/TP2/MULTI через публичный API; GenAI-LLMPipeline при наличии, иначе indicative decode-step proxy) + `tools/tp_bench/README.md` + бенч-план `docs/notes/tp-bench-plan.md` (метрики/среда/команды/критерии/профиль узких мест). **GATE по перфу не подтверждён** — сборки/2 GPU/GenAI нет (см. «Блокеры»); ожидаемый вклад: host-USM staging G0 (~4–5 GB/s) + преимущественно REPLICATED Qwen → TPOT_ratio≈1.0 до S15 |
 | 2026-10-18 | S15 Stage5.1 перф (peer + ring allreduce) | **частично** (код+тест+перф-отчёт; прогон недоступен) | **Peer-probe**: `zeDeviceCanAccessPeer` добавлен в weak-symbols (`zero_api.hpp`); `cldnn::gpu_devices_peer_accessible(size_t)` (`include/intel_gpu/runtime/device_query.hpp` + новый `src/runtime/tp_peer.cpp`) перечисляет L0-устройства, проверяет все пары `i≠j`, кэширует по числу рангов, не бросает, консервативно (true только если все пары доступны). `tp_transport_capabilities()` → `tp_transport_capabilities(size_t)` (кэш по k); `kind=PEER` при peer-доступе. **PEER fast-path**: `TPTransport::PeerRegionCopy` + `set_peer_region_copy()`; в `all_gather_axis`/`scatter_axis` копия региона идёт через бэкенд только при `kind==PEER && backend` — на 2× A770 (peer=false) ветка **подготовлена, но неактивна**, работает host-staging (G0). **Ring allreduce**: `all_reduce_sum_fp32` теперь ring reduce-scatter + all-gather (`ring_all_reduce_fp32`, k−1+k−1 шагов, fp32, требуется `S%k==0`, иначе `HOST_SUM`); реплицированный bias/residual по-прежнему вычитается `(k−1)` раз → считается один раз. Крит. путь k=2: `S·4` байт против `2S·4` ранее. Интроспекция — `TPAllReduceAlgorithm{RING,HOST_SUM}` + `TPAllReduceStats{algorithm,messages,bytes}` + `last_all_reduce_stats()`. **Тест**: `KsplitRingAllReduceDeterministicAcrossRuns` (повторный infer и свежий запрос — бит-в-бит + паритет 1-GPU). **Отчёт**: `docs/notes/s15-perf-report.md` (трафик-модель, prefill/decode-профиль, GATE-решение). **GATE TPOT≥1.5×/TTFT≥1.3× НЕ подтверждён** — сборки/2 GPU/GenAI нет; аналитически реальный Qwen преимущественно REPLICATED → TPOT_ratio≈1.0, ≥1.5× требует in-graph коллективов и/или peer-копий |
+| 2026-10-18 | S16 Stage5.2 стабилизация (per-rank blob-cache) | **частично** (код+тесты+доки; прогон недоступен) | **Per-rank blob-cache.** `TPCompiledModel::export_model` (`tp_compiled_model.cpp`) вместо NOT_IMPLEMENTED пишет один конверт: `[ "TPSB" magic=0x54505342 ][ uint32 version=1 ][ uint64 num_ranks ][ TPPlan ][ по рангу: uint64 size + байты ]`, где байты ранга — независимый single-device блоб из `CompiledModel::export_model` ранга (срезанные веса + per-rank ExecutionConfig). `Plugin::import_model_tensor_parallel` (`plugin.cpp`) восстанавливает каждый ранг на **своём** device-контексте (`get_default_context(plan.rank_device_ids[r])`) с per-rank `ExecutionConfig` (штамп `tp_rank`/`tp_num_ranks`), план (seams/output_seams/state_seams) — из конверта; single-device импорт вынесен в helper `import_single_device_model(..., tensor_base)`, чтобы TP-импорт переиспользовал штатный путь. Non-TP путь НЕ изменён; при запросе TP-политики без magic/несовпадении версии — throw. Сериализация плана — `save_tp_plan/load_tp_plan` (`tp_plan.cpp`) на `cldnn::Binary{Out,In}putBuffer` (enum→uint8_t, shape→PartialShape-сериализатор). Тесты S16 (`tensor_parallel.cpp`): `S16ExportImportRoundtripMatchesSingleGpu` (ranks/seams сохраняются, паритет vs 1-GPU), `S16ExportImportKsplitRoundtripMatchesSingleGpu`, `S16ExportImportStatefulRoundtripMatchesSingleGpu`, `S16ImportWithoutTpPolicyIsRejected`, `S16ImportForeignSingleDeviceBlobIsRejected`. **Финал проекта**: карта артефактов/ограничений (`docs/notes/tp-artifacts.md`), план upstream-серии PR (`docs/notes/upstream-series.md`), перф-матрица (`docs/notes/s16-perf-matrix.md`). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, 2 GPU/GenAI недоступны |
 | 2026-10-18 | S13 Stage4.1 GenAI интеграция | **частично** (обвязка+тесты+док; прогон недоступен) | **Probe/путь свойства**: GenAI (openvino.genai, CB-бенчмарк — в этом дереве отсутствует, S01) передаёт строковый `ov::AnyMap {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` в `core.compile_model(model,"GPU",config)`; `ov::PluginConfig::set_user_property` конвертирует строку в `std::set<ov::hint::ModelDistributionPolicy>` (`ov::Any::as`, `any.hpp:767-784`; set Readable, enum Istreamable), GPU рекламирует свойство RW (`plugin.cpp:893`) → `compile_model_tensor_parallel` (`plugin.cpp:285`). **Расхождения property/config нет — правок плагина не требуется.** Разбор — `docs/notes/genai-integration.md` (§2 путь, §3 совместимость compile-фрейма, §4 ограничение реального Qwen, §5 тест-план) + `gpu-plugin-arch.md` §7. **Совместимость compile-фрейма**: name-based `set_tensor/get_tensor` (через `getPort` над `get_inputs()/get_outputs()`), `query_state()/set_state()` (`TPAggregatedState`) — покрывают GenAI-потребление stateful-модели. **Тесты S13** (`tensor_parallel.cpp`): `GenAiStringConfigEnablesTensorParallel` (строковый GenAI-конфиг → tp_ranks {0,1}, RO-property `model_distribution_policy`, seams непусты), `GenAiStyleStatefulRoundtripMatchesSingleGpu` (билдер `make_genai_style_stateful_model` с named IO `input_ids`/`logits` и динамическим seq; HEAD_SHARDED state, 4 шага + roundtrip `query_state/set_state`, паритет vs 1-GPU). **Реальный Qwen3.5-9B-int4 на TP2 остаётся преимущественно REPLICATED** (S07–S12) → генерация численно паритетна 1-GPU; спид-ап — S14+ (in-graph коллективы — S15). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, GenAI/2 GPU недоступны (см. «Блокеры») |
 
 ## Блокеры / открытые вопросы
+- **S16 GATE частичный (2026-10-18) — финал проекта.** Per-rank blob-cache (export/import конверта рангов),
+  финальные доки и план upstream-серии готовы, тесты S16 написаны, но **сборка OpenVINO недоступна**
+  (сабмодули пусты) и **2× GPU/GenAI на сборочной машине нет** → прогон `tensor_parallel` (S05–S16) и
+  `tp_bench.py` не выполнялся. Нерешённые ограничения (осознанно оставлены вне S16): реальный Qwen
+  преимущественно REPLICATED (нет in-graph межранговых коллективов), peer-копии неактивны на A770
+  (`zeDeviceCanAccessPeer`=false), кэш-блоб не zero-copy-оптимизирован (per-rank ранги пересобираются из
+  памяти). См. `docs/notes/tp-artifacts.md` (ограничения) и `docs/notes/upstream-series.md` (что выносить).
 - **S15 GATE частичный (2026-10-18).** Peer-probe + ring allreduce + перф-отчёт готовы, тест написан,
   но **сборка OpenVINO недоступна** (сабмодули пусты) и **2× GPU / OpenVINO GenAI на сборочной машине нет**
   → главный GATE **TPOT ≥ 1.5× / TTFT ≥ 1.3× на 2× BMG** не подтверждён. Аналитика: реальный Qwen
@@ -94,6 +102,41 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S16 done (частично, 2026-10-18) — ПРОЕКТ ЗАВЕРШЁН.** Stage 5.2 стабилизация: per-rank blob-cache + финальные доки + план upstream-серии. Артефакты/решения:
+  - **Per-rank blob-cache — зачем**: раньше `TPCompiledModel::export_model` бросал NOT_IMPLEMENTED →
+    `CoreImpl::compile_model_and_cache` ловил исключение и **удалял cache-entry** → TP-кэш молча отключался
+    (безопасно: чужой блоб не писался). Обычный `Plugin::import_model` всегда строит single-device
+    CompiledModel, поэтому TP-блоб нельзя было им импортировать без потери рангов.
+  - **Формат конверта** (`TPCompiledModel::export_model`, `tp_compiled_model.cpp`):
+    `[ "TPSB" 0x54505342 (uint32) ][ version=1 (uint32) ][ num_ranks (uint64) ][ TPPlan ]
+     [ per rank r=0..k-1: uint64 blob_size ; blob_bytes ]`. `blob_bytes` ранга = `rank->export_model(ss)`
+    (независимый single-device блоб: срезанные веса + per-rank config). Ранги **никогда** не делят блоб.
+  - **Импорт** (`Plugin::import_model_tensor_parallel`, `plugin.cpp`): читает конверт probe-движком
+    (magic/version/plan), затем на каждый ранг — `get_default_context(plan.rank_device_ids[r])` + per-rank
+    `ExecutionConfig` (`m_configs_map.at(device_id)` + `set_user_property(orig_config, RELEASE)` + штамп
+    `tp_rank=r`/`tp_num_ranks`), `import_single_device_model(rank_stream, ctx, rank_cfg, true, nullptr)`.
+    Собирает `TPCompiledModel(plugin, rank_models, plan)`. **Guard**: неверный magic/version → `OPENVINO_ASSERT`.
+    **Маршрутизация**: `Plugin::import_model` после сборки `config` проверяет `is_tensor_parallel_requested(config)`
+    и уходит в TP-импорт; иначе — прежний single-device путь (не изменён). Helper
+    `import_single_device_model(model, context_impl, config, loaded_from_cache, tensor_base)` — вынесен из
+    старого тела `import_model` (tensor_base=nullptr для rank-импортов: per-rank контекст, не tensor-backed).
+  - **Сериализация плана** (`save_tp_plan`/`load_tp_plan`, `tp_plan.{hpp,cpp}`): на `cldnn::BinaryOutputBuffer/
+    BinaryInputBuffer`; enum-class → `uint8_t`, `ov::PartialShape` — штатным layout-сериализатором,
+    `std::vector<float>` (replicated_adds.values) и `std::vector<std::string>` — vector/string-сериализаторами.
+    Forward-declare `cldnn::Binary{Output,Input}Buffer` в заголовке.
+  - **Точки касания**: `tp_plan.{hpp,cpp}`, `tp_compiled_model.cpp`, `plugin.{hpp,cpp}`
+    (`import_model_tensor_parallel`, `import_single_device_model`, include `<sstream>`
+    + `binary_buffer.hpp` + tp-заголовки), `tensor_parallel.cpp` (5 тестов S16). Публичные свойства/форматы
+    seam'ов не менялись; non-TP блоб-формат не менялся.
+  - **Тесты S16**: `S16ExportImportRoundtripMatchesSingleGpu` (ranks `{0,1}` + seams сохраняются,
+    паритет vs 1-GPU), `S16ExportImportKsplitRoundtripMatchesSingleGpu` (K_SPLIT, replicated residual/bias),
+    `S16ExportImportStatefulRoundtripMatchesSingleGpu` (HEAD_SHARDED state, `query_state()` полной формы),
+    `S16ImportWithoutTpPolicyIsRejected` (TP-блоб без политики → throw), `S16ImportForeignSingleDeviceBlobIsRejected`
+    (single-device блоб + политика → throw). Прогон — вне сессии (нет сборки/2 GPU).
+  - **Финальные доки**: `docs/notes/tp-artifacts.md` (карта артефактов + ограничения + как воспроизвести),
+    `docs/notes/upstream-series.md` (серия PR для upstream), `docs/notes/s16-perf-matrix.md` (перф-матрица,
+    аналитика + чек-лист замеров). Итог проекта — в `NEXT.md`.
+  - **Блокер прежний**: сборка OpenVINO недоступна (сабмодули пусты), 2× GPU / GenAI нет → GATE S16 частичный.
 - **S15 done (частично, 2026-10-18)** — Stage 5.1 перф: peer-копии + ring allreduce + prefill/decode-отчёт. Артефакты/решения:
   - **Peer-probe (runtime, самодостаточен)**: `zeDeviceCanAccessPeer` добавлен в `weak_symbols_list()`
     (`src/common/zero_loader/include/openvino/zero_api.hpp`); объявление `bool cldnn::gpu_devices_peer_accessible(size_t)`

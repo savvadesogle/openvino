@@ -2,10 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // [TP-GPU, S05] Experimental GPU tensor-parallel support.
+// S16 adds export_model(): the per-rank cache envelope (one independent single-device blob per
+// rank + TPPlan), imported back by Plugin::import_model_tensor_parallel.
 // See PLAN.md §4.1, §4.4.
 
 #include "intel_gpu/plugin/tp/tp_compiled_model.hpp"
 
+#include <sstream>
+#include <string>
+
+#include "intel_gpu/graph/serialization/binary_buffer.hpp"
 #include "intel_gpu/plugin/tp/tp_infer_request.hpp"
 #include "intel_gpu/runtime/internal_properties.hpp"
 #include "intel_gpu/runtime/itt.hpp"
@@ -116,8 +122,37 @@ std::shared_ptr<ov::ISyncInferRequest> TPCompiledModel::create_sync_infer_reques
     return std::make_shared<TPInferRequest>(std::static_pointer_cast<const TPCompiledModel>(shared_from_this()));
 }
 
-void TPCompiledModel::export_model(std::ostream&) const {
-    OPENVINO_THROW_NOT_IMPLEMENTED("[GPU][TP] Export of a tensor-parallel compiled model is not supported yet");
+// [S16] Per-rank blob cache. A tensor-parallel compiled model is exported as a single envelope that
+// carries one *independent* single-device blob per rank plus the TPPlan:
+//
+//     [ "TPSB" magic ][ uint32 version ][ uint64 num_ranks ]
+//     [ TPPlan (ranks / device ids / seams / output seams / state seams) ]
+//     [ per rank, in rank order: uint64 blob_size ; blob bytes ]
+//
+// Each rank's bytes come from its own CompiledModel::export_model(), i.e. the exact device-local
+// program (sliced weights + per-rank ExecutionConfig). Ranks therefore never share a blob: on
+// import each rank is deserialized with its own device engine/context (see
+// Plugin::import_model_tensor_parallel). The blob is only ever written for TP groups built by
+// compile_model_tensor_parallel, so the ordinary single-device cache format is untouched.
+void TPCompiledModel::export_model(std::ostream& model) const {
+    OV_ITT_SCOPED_TASK(itt::domains::intel_gpu_plugin, "TPCompiledModel::export_model");
+    OPENVINO_ASSERT(!m_ranks.empty(), "[GPU][TP] Compiled model not loaded");
+
+    cldnn::BinaryOutputBuffer ob(model);
+    ob << TENSOR_PARALLEL_BLOB_MAGIC;
+    ob << TENSOR_PARALLEL_BLOB_VERSION;
+    ob << static_cast<uint64_t>(m_ranks.size());
+
+    save_tp_plan(ob, m_plan);
+
+    for (const auto& rank : m_ranks) {
+        std::stringstream rank_stream;
+        rank->export_model(rank_stream);
+        const std::string rank_blob = rank_stream.str();
+        ob << static_cast<uint64_t>(rank_blob.size());
+        ob << cldnn::make_data(rank_blob.data(), static_cast<uint64_t>(rank_blob.size()));
+    }
+    ob.flush();
 }
 
 std::shared_ptr<const ov::Model> TPCompiledModel::get_runtime_model() const {
