@@ -386,7 +386,10 @@ std::vector<ov::SoPtr<ov::ITensor>> TPInferRequest::get_tensors(const ov::Output
     if (found_port.is_input()) {
         return m_rank_requests.front()->get_tensors(port);
     }
-    return {get_tensor(port)};
+    // Outputs are served as single (non-batched) tensors owned by this request. Reporting a
+    // non-empty batched list here would forbid the base-class get_tensor()/get_output_tensor()
+    // API (see ov::InferRequest::get_tensor), so a single output must map to an empty list.
+    return {};
 }
 
 void TPInferRequest::set_tensors(const ov::Output<const ov::Node>& port,

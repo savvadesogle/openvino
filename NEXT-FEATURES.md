@@ -35,6 +35,29 @@ S20  Подготовка upstream-серии (после стабилизаци
 
 ## S17 — In-graph межранговые коллективы (снятие REPLICATED)
 
+> **Входные факты от S16 hardware validation (2× Arc A770, 2026-10-18).** Подтверждено на железе:
+> сборка/тесты/бенч выполнены; паритет ядра шардинга — зелёный. Ниже — то, что S17 **обязан** закрыть.
+> 1. **Перф-потолок подтверждён замером**: `tp_bench.py` (indicative `decode_step_proxy`, GenAI нет) дал
+>    `TP1 = 0.0512 s`, `TP2 = 0.0643 s` → `TP1/TP2 = 0.80` (TP2 медленнее). Профиль TP2:
+>    `rank0=20.3 ms` + `rank1=20.2 ms` node-time, wall ≈64 ms → ≈24 ms/шаг невычислительного оверхеда.
+>    Реальный Qwen почти целиком **REPLICATED** → нужен именно S17 (снятие REPLICATED) для вклада в ≥1.3×.
+> 2. **Ограничение harness**: без `openvino_genai` реальные `TTFT`/`TPOT` не снимаются; `MULTI:GPU,GPU`
+>    не запускается (`AUTO cumulative model doesn't support stateful model`). Финальный GATE-замер — только
+>    с GenAI (`NEXT-TESTING.md`).
+> 3. **Реальный TP-баг (блокирует S13/GenAI-паритет), фикс — вне test-only сессии:**
+>    `TPCompiledModel::build_output_ports()` (`tp_compiled_model.cpp:90-96`) создаёт **синтетический**
+>    full-shape `Result` для ALL_GATHER-выходов (в т.ч. выход head-sharded состояния) и **не переносит**
+>    `port.get_names()`/friendly-name. Итог: `compiled.output(0).get_names()` пуст → `get_tensor("logits")`
+>    и GenAI name-based binding падают (`GenAiStyleStatefulRoundtripMatchesSingleGpu`:
+>    `Port for tensor name logits was not found`); plain single-GPU имена сохраняет. Фикс: при построении
+>    синтетического порта скопировать `port.get_names()` на `result->output(0).get_tensor()` (и friendly
+>    name). Добавить регресс-тест «TP output tensor names preserved for all-gathered outputs».
+> 4. **Stateful-паритет не проверен**: 10 из 11 падений `*TensorParallel*` — pre-existing ограничения
+>    GPU-плагина на stateful-моделях теста (rank-3 `ReadValue`+`Add` при «средней» оси >2 →
+>    `Argument shapes are inconsistent`; rank-3 stateful depthwise `GroupConvolution`; `query_state()` batch
+>    `0`). Воспроизведено на stock upstream `2026.5.0-22967` **без TP**. Нужно поправить тест-модели
+>    (иные формы / явный init) либо плагин — завести отдельной задачей (не TP-регресс).
+
 **Проблема.** Сейчас сборка результата и агрегация состояния живут на границе модели (`TPInferRequest`:
 `assemble_outputs`/`assemble_reduce_sum`/`TPAggregatedState`), а промежуточные швы между слоями не
 поддерживаются → реальные Qwen-слои (coupled fused `in_proj`, `Concat`/`Loop`/`ScatterNDUpdate`) остаются

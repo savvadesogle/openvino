@@ -459,9 +459,9 @@ TEST_F(TensorParallelCompileGPU, CompilesMiniModelOnTwoGpus) {
 
     ov::CompiledModel compiled_model;
     OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props));
-    ASSERT_NE(compiled_model, nullptr);
+    ASSERT_TRUE(compiled_model);
 
-    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks);
     ASSERT_EQ(ranks.size(), 2u) << "Expected exactly 2 tensor-parallel ranks";
     EXPECT_EQ(ranks, (std::vector<int32_t>{0, 1}));
 }
@@ -478,7 +478,7 @@ TEST_F(TensorParallelCompileGPU, InternalFlagAlsoEnablesTensorParallel) {
     ov::CompiledModel compiled_model;
     OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props));
 
-    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks);
     EXPECT_EQ(ranks.size(), 2u);
 }
 
@@ -488,7 +488,7 @@ TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoRanks) {
 
     ov::CompiledModel compiled_model;
     OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU));
-    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks);
     EXPECT_TRUE(ranks.empty());
 }
 
@@ -566,18 +566,18 @@ TEST_F(TensorParallelCompileGPU, ShardTransformDetectsAndReportsSeams) {
     ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
 
     auto compiled = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props);
-    auto seams = compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u) << "Expected exactly one detected MatMul seam";
     // Format: "<kind>:<collective>:<node_type>:<node_name>".
     EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
 
     // Determinism/stability: recompiling the same model yields an identical seam list.
     auto compiled_again = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, props);
-    auto seams_again = compiled_again.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams_again = compiled_again.get_property(ov::intel_gpu::tp_seams);
     EXPECT_EQ(seams, seams_again);
 
     // The seam list must be advertised among the supported properties.
-    auto supported = compiled.get_property(ov::supported_properties).as<std::vector<ov::PropertyName>>();
+    auto supported = compiled.get_property(ov::supported_properties);
     EXPECT_NE(std::find(supported.begin(), supported.end(), ov::intel_gpu::tp_seams.name()), supported.end());
 }
 
@@ -594,7 +594,7 @@ TEST_F(TensorParallelCompileGPU, ShardTransformClassifiesResidualProjectionAsKSp
     ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
 
     auto compiled = core.compile_model(residual_model, ov::test::utils::DEVICE_GPU, props);
-    auto seams = compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u) << "Expected exactly one detected MatMul seam";
     EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
 }
@@ -606,9 +606,9 @@ TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoSeams) {
 
     ov::CompiledModel compiled_model;
     OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU));
-    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams);
     EXPECT_TRUE(seams.empty());
-    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks);
     EXPECT_TRUE(ranks.empty());
 }
 
@@ -642,7 +642,7 @@ TEST_F(TensorParallelCompileGPU, NsplitMlpParityMatchesSingleGpu) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
     // The N-split seam is detected; rank-0 output is advertised at the full N shape.
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
 
@@ -692,7 +692,7 @@ TEST_F(TensorParallelCompileGPU, NsplitNotDivisibleFallsBackToReplica) {
                           tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)}));
 
     // Graceful fallback: the seam is reported as REPLICA (not sliced/assembled).
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("REPLICA:", 0), 0u) << "Unexpected seam: " << seams[0];
 
@@ -745,10 +745,10 @@ TEST_F(TensorParallelCompileGPU, KsplitResidualParityMatchesSingleGpu) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
     // The projection must be classified K_SPLIT and set up as an all-reduce(sum) output.
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     ASSERT_EQ(output_seams.size(), 1u) << "Expected exactly one all-reduce output seam";
     EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
 
@@ -803,11 +803,11 @@ TEST_F(TensorParallelCompileGPU, KsplitNotDivisibleFallsBackToReplica) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
     // Classification is stable (no hard failure) ...
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
     // ... but nothing was sliced, so there is no assembly output (rank 0 computes the full result).
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     EXPECT_TRUE(output_seams.empty());
 
     auto tp_request = tp_compiled.create_infer_request();
@@ -859,7 +859,7 @@ TEST_F(TensorParallelCompileGPU, KsplitRingAllReduceDeterministicAcrossRuns) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
     // This model is classified K_SPLIT with an all-reduce output seam (ring all-reduce path).
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     ASSERT_EQ(output_seams.size(), 1u) << "Expected exactly one all-reduce output seam";
     EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
 
@@ -927,10 +927,10 @@ TEST_F(TensorParallelCompileGPU, Int4NsplitParityMatchesSingleGpu) {
     std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("N_SPLIT:ALL_GATHER:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     ASSERT_EQ(output_seams.size(), 1u) << "Expected the int4 N-split to set up an all-gather output";
     EXPECT_EQ(output_seams[0].rfind("ALL_GATHER:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
 
@@ -985,10 +985,10 @@ TEST_F(TensorParallelCompileGPU, Int4KsplitParityMatchesSingleGpu) {
     std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     ASSERT_EQ(output_seams.size(), 1u) << "Expected the int4 K-split to set up an all-reduce output";
     EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
 
@@ -1045,10 +1045,10 @@ TEST_F(TensorParallelCompileGPU, Int4KsplitIndivisibleFallsBackToReplica) {
     std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = tp_compiled.get_property(ov::intel_gpu::tp_seams);
     ASSERT_EQ(seams.size(), 1u);
     EXPECT_EQ(seams[0].rfind("K_SPLIT:ALL_REDUCE_SUM:MatMul:", 0), 0u) << "Unexpected seam: " << seams[0];
-    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams);
     EXPECT_TRUE(output_seams.empty()) << "Indivisible group count must not set up an all-reduce output";
 
     auto tp_request = tp_compiled.create_infer_request();
@@ -1081,7 +1081,7 @@ TEST_F(TensorParallelCompileGPU, StateHeadShardingMatchesSingleGpu) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     // "HEAD_SHARDED:<axis>:<full_dim>:<variable_id>" -> axis 1, full_dim 4.
     EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
@@ -1137,7 +1137,7 @@ TEST_F(TensorParallelCompileGPU, StateNonBroadcastOperandStaysReplicated) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
 
@@ -1172,7 +1172,7 @@ TEST_F(TensorParallelCompileGPU, DefaultCompileHasNoStateSeams) {
     ov::Core core;
     auto plain_model = make_stateful_head_model(4, 2, /*broadcast_input=*/true);
     auto compiled = core.compile_model(plain_model, ov::test::utils::DEVICE_GPU);
-    auto state_seams = compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = compiled.get_property(ov::intel_gpu::tp_state_seams);
     EXPECT_TRUE(state_seams.empty());
 }
 
@@ -1196,7 +1196,7 @@ TEST_F(TensorParallelCompileGPU, LinearAttentionConvStateHeadShardingMatchesSing
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     // "HEAD_SHARDED:<axis>:<full_dim>:<variable_id>" -> axis 1, full_dim 4.
     EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
@@ -1255,7 +1255,7 @@ TEST_F(TensorParallelCompileGPU, LinearAttentionConvStateIndivisibleStaysReplica
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
 
@@ -1307,7 +1307,7 @@ TEST_F(TensorParallelCompileGPU, DynamicStateHeadShardingMatchesSingleGpu) {
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
     // The dynamic batch must not force replication: head axis 1 (size 4) is static and divisible.
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
     EXPECT_NE(state_seams[0].find(":1:4:"), std::string::npos) << "Unexpected state seam: " << state_seams[0];
@@ -1358,7 +1358,7 @@ TEST_F(TensorParallelCompileGPU, DynamicStateIndivisibleStaysReplicated) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
                                           {ov::hint::model_distribution_policy(tp_policy)});
 
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     EXPECT_EQ(state_seams[0].rfind("REPLICATED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
 
@@ -1629,16 +1629,16 @@ TEST_F(TensorParallelCompileGPU, GenAiStringConfigEnablesTensorParallel) {
     ov::CompiledModel compiled_model;
     OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, genai_config));
 
-    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks);
     EXPECT_EQ(ranks, (std::vector<int32_t>{0, 1})) << "GenAI string config did not enable tensor parallel";
 
     // The string is surfaced as the typed enum set (read-only report).
     auto policy = compiled_model.get_property(ov::hint::model_distribution_policy)
-                      .as<std::set<ov::hint::ModelDistributionPolicy>>();
+                      ;
     EXPECT_EQ(policy.count(ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL), 1u);
 
     // The shard-detection pass must have run on this GenAI-style compile.
-    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams);
     EXPECT_FALSE(seams.empty());
 }
 
@@ -1663,7 +1663,7 @@ TEST_F(TensorParallelCompileGPU, GenAiStyleStatefulRoundtripMatchesSingleGpu) {
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, genai_config);
 
     // The named state variable must be head-sharded (aggregated at the GenAI boundary).
-    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
     ASSERT_EQ(state_seams.size(), 1u);
     EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
 
@@ -1743,7 +1743,7 @@ TEST_F(TensorParallelCompileGPU, S16ExportImportRoundtripMatchesSingleGpu) {
     ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
 
-    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams);
 
     std::stringstream blob;
     OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
@@ -1752,12 +1752,12 @@ TEST_F(TensorParallelCompileGPU, S16ExportImportRoundtripMatchesSingleGpu) {
     std::stringstream in(blob.str());
     ov::CompiledModel imported;
     OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
-    ASSERT_NE(imported, nullptr);
+    ASSERT_TRUE(imported);
 
     // Rank table and seams must be restored verbatim from the envelope plan.
-    const auto ranks = imported.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    const auto ranks = imported.get_property(ov::intel_gpu::tp_ranks);
     EXPECT_EQ(ranks, (std::vector<int32_t>{0, 1}));
-    const auto seams_after = imported.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    const auto seams_after = imported.get_property(ov::intel_gpu::tp_seams);
     EXPECT_EQ(seams_before, seams_after);
 
     auto req = imported.create_infer_request();
@@ -1797,7 +1797,7 @@ TEST_F(TensorParallelCompileGPU, S16ExportImportKsplitRoundtripMatchesSingleGpu)
     std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
     ov::AnyMap props = {ov::hint::model_distribution_policy(tp_policy)};
     auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, props);
-    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_seams);
 
     std::stringstream blob;
     OV_ASSERT_NO_THROW(tp_compiled.export_model(blob));
@@ -1806,7 +1806,7 @@ TEST_F(TensorParallelCompileGPU, S16ExportImportKsplitRoundtripMatchesSingleGpu)
     ov::CompiledModel imported;
     OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
 
-    EXPECT_EQ(imported.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>(), seams_before);
+    EXPECT_EQ(imported.get_property(ov::intel_gpu::tp_seams), seams_before);
 
     auto req = imported.create_infer_request();
     req.set_input_tensor(0, x);
@@ -1842,8 +1842,8 @@ TEST_F(TensorParallelCompileGPU, S16ExportImportStatefulRoundtripMatchesSingleGp
     OV_ASSERT_NO_THROW(imported = core.import_model(in, ov::test::utils::DEVICE_GPU, props));
 
     // The state seam (variable sharding) must have been restored with the plan.
-    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
-    const auto seams_after = imported.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    const auto seams_before = tp_compiled.get_property(ov::intel_gpu::tp_state_seams);
+    const auto seams_after = imported.get_property(ov::intel_gpu::tp_state_seams);
     EXPECT_EQ(seams_before, seams_after);
 
     ov::Tensor seed(ov::element::f32, ov::Shape{1, heads, head_dim});

@@ -258,7 +258,7 @@ bool is_elementwise(const std::shared_ptr<ov::Node>& node) {
            ov::is_type<ov::op::v0::Elu>(node) || ov::is_type<ov::op::v0::Erf>(node) ||
            ov::is_type<ov::op::v0::Exp>(node) || ov::is_type<ov::op::v0::Log>(node) ||
            ov::is_type<ov::op::v0::Negative>(node) || ov::is_type<ov::op::v0::Relu>(node) ||
-           ov::is_type<ov::op::v0::Sigmoid>(node) || ov::is_type<ov::op::v0::Softplus>(node) ||
+           ov::is_type<ov::op::v0::Sigmoid>(node) || ov::is_type<ov::op::v4::SoftPlus>(node) ||
            ov::is_type<ov::op::v0::Tanh>(node) || ov::is_type<ov::op::v1::Add>(node) ||
            ov::is_type<ov::op::v1::Divide>(node) || ov::is_type<ov::op::v1::Multiply>(node) ||
            ov::is_type<ov::op::v1::Subtract>(node) || ov::is_type<ov::op::v4::Swish>(node) ||

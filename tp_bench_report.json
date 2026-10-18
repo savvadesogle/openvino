@@ -1,0 +1,25 @@
+{
+  "model": "models/Qwen3.5-9B-int4-ov",
+  "lm": "models/Qwen3.5-9B-int4-ov/openvino_language_model.xml",
+  "num_gpus": 2,
+  "warmup": 2,
+  "iters": 10,
+  "prompt_len": 128,
+  "max_new_tokens": 128,
+  "greedy": true,
+  "variants": {
+    "TP1": {
+      "step_s": 0.05121809999945981,
+      "samples": 10,
+      "source": "ov.decode_step_proxy (no GenAI; indicative only)"
+    },
+    "TP2": {
+      "step_s": 0.0643373499988229,
+      "samples": 10,
+      "source": "ov.decode_step_proxy (no GenAI; indicative only)"
+    },
+    "MULTI": {
+      "error": "Exception from src\\inference\\src\\cpp\\core.cpp:120:\nException from src\\inference\\src\\dev\\plugin.cpp:54:\nException from src\\plugins\\auto\\src\\plugin.cpp:1284:\nAUTO cumulative model doesn't support stateful model.\n\n\n"
+    }
+  }
+}

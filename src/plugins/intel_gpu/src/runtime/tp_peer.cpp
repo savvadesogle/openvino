@@ -13,7 +13,9 @@
 #include <utility>
 #include <vector>
 
+#ifdef OV_GPU_WITH_ZE_RT
 #include "openvino/zero_api.hpp"
+#endif
 
 namespace cldnn {
 
@@ -35,6 +37,7 @@ bool gpu_devices_peer_accessible(size_t count) {
     }
 
     bool result = false;
+#ifdef OV_GPU_WITH_ZE_RT
     try {
         // ZeroApi loads ze_loader on construction; when it is missing (or a required core symbol
         // cannot be resolved) the constructor throws and we conservatively fall back to host staging.
@@ -80,6 +83,7 @@ bool gpu_devices_peer_accessible(size_t count) {
     } catch (...) {
         result = false;
     }
+#endif
 
     cache[count] = result;
     return result;

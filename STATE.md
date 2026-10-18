@@ -31,6 +31,7 @@
 - [x] S15 Stage5.1 перф (2026-10-18; peer-probe+ring allreduce+perf-отчёт, GATE частичный — сборка/2 GPU недоступны)
 - [x] S16 Stage5.2 стабилизация (2026-10-18; per-rank blob-cache+финальные доки+upstream-серия, GATE частичный — сборка/2 GPU недоступны) — **проект завершён**
 - [x] Push (2026-10-18): ветка `feature/gpu-tensor-parallel` → `origin` (форк `savvadesogle/openvino`); локальный HEAD = remote HEAD = `45954afb`; снято правило «только локально»
+- [x] **S16 hardware validation (2026-10-18)**: собрана OpenVINO `2026.5.0-26-2941d4f40c9-feature/gpu-tensor-parallel` (Release; GPU-плагин+Python+`ov_gpu_func_tests`) на 2× Arc A770; `*TensorParallel*` **24/35 passed**; `tp_bench.py` — indicative proxy (GenAI нет). GATE частичный (см. ниже)
 
 ## Гейт-решения (журнал)
 | Дата | Гейт | Решение | Обоснование |
@@ -59,8 +60,25 @@
 | 2026-10-18 | S16 Stage5.2 стабилизация (per-rank blob-cache) | **частично** (код+тесты+доки; прогон недоступен) | **Per-rank blob-cache.** `TPCompiledModel::export_model` (`tp_compiled_model.cpp`) вместо NOT_IMPLEMENTED пишет один конверт: `[ "TPSB" magic=0x54505342 ][ uint32 version=1 ][ uint64 num_ranks ][ TPPlan ][ по рангу: uint64 size + байты ]`, где байты ранга — независимый single-device блоб из `CompiledModel::export_model` ранга (срезанные веса + per-rank ExecutionConfig). `Plugin::import_model_tensor_parallel` (`plugin.cpp`) восстанавливает каждый ранг на **своём** device-контексте (`get_default_context(plan.rank_device_ids[r])`) с per-rank `ExecutionConfig` (штамп `tp_rank`/`tp_num_ranks`), план (seams/output_seams/state_seams) — из конверта; single-device импорт вынесен в helper `import_single_device_model(..., tensor_base)`, чтобы TP-импорт переиспользовал штатный путь. Non-TP путь НЕ изменён; при запросе TP-политики без magic/несовпадении версии — throw. Сериализация плана — `save_tp_plan/load_tp_plan` (`tp_plan.cpp`) на `cldnn::Binary{Out,In}putBuffer` (enum→uint8_t, shape→PartialShape-сериализатор). Тесты S16 (`tensor_parallel.cpp`): `S16ExportImportRoundtripMatchesSingleGpu` (ranks/seams сохраняются, паритет vs 1-GPU), `S16ExportImportKsplitRoundtripMatchesSingleGpu`, `S16ExportImportStatefulRoundtripMatchesSingleGpu`, `S16ImportWithoutTpPolicyIsRejected`, `S16ImportForeignSingleDeviceBlobIsRejected`. **Финал проекта**: карта артефактов/ограничений (`docs/notes/tp-artifacts.md`), план upstream-серии PR (`docs/notes/upstream-series.md`), перф-матрица (`docs/notes/s16-perf-matrix.md`). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, 2 GPU/GenAI недоступны |
 | 2026-10-18 | Push в origin | done | Ветка `feature/gpu-tensor-parallel` отправлена в `origin` (форк `savvadesogle/openvino`); локальный HEAD = remote HEAD = `45954afb`. Отменяет правило «только локально» (2026-10-17); `upstream` не тронут. PAT использован разово через credential-helper, в файлы/конфиг/history не записан; **токен из чата подлежит отзыву** |
 | 2026-10-18 | S13 Stage4.1 GenAI интеграция | **частично** (обвязка+тесты+док; прогон недоступен) | **Probe/путь свойства**: GenAI (openvino.genai, CB-бенчмарк — в этом дереве отсутствует, S01) передаёт строковый `ov::AnyMap {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` в `core.compile_model(model,"GPU",config)`; `ov::PluginConfig::set_user_property` конвертирует строку в `std::set<ov::hint::ModelDistributionPolicy>` (`ov::Any::as`, `any.hpp:767-784`; set Readable, enum Istreamable), GPU рекламирует свойство RW (`plugin.cpp:893`) → `compile_model_tensor_parallel` (`plugin.cpp:285`). **Расхождения property/config нет — правок плагина не требуется.** Разбор — `docs/notes/genai-integration.md` (§2 путь, §3 совместимость compile-фрейма, §4 ограничение реального Qwen, §5 тест-план) + `gpu-plugin-arch.md` §7. **Совместимость compile-фрейма**: name-based `set_tensor/get_tensor` (через `getPort` над `get_inputs()/get_outputs()`), `query_state()/set_state()` (`TPAggregatedState`) — покрывают GenAI-потребление stateful-модели. **Тесты S13** (`tensor_parallel.cpp`): `GenAiStringConfigEnablesTensorParallel` (строковый GenAI-конфиг → tp_ranks {0,1}, RO-property `model_distribution_policy`, seams непусты), `GenAiStyleStatefulRoundtripMatchesSingleGpu` (билдер `make_genai_style_stateful_model` с named IO `input_ids`/`logits` и динамическим seq; HEAD_SHARDED state, 4 шага + roundtrip `query_state/set_state`, паритет vs 1-GPU). **Реальный Qwen3.5-9B-int4 на TP2 остаётся преимущественно REPLICATED** (S07–S12) → генерация численно паритетна 1-GPU; спид-ап — S14+ (in-graph коллективы — S15). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, GenAI/2 GPU недоступны (см. «Блокеры») |
+| 2026-10-18 | **S16 hardware validation (2× A770)** | **частично (перф) / частично (корректность)** | **Сборка**: OpenVINO собрана (`2026.5.0-26-2941d4f40c9-feature/gpu-tensor-parallel`, Release; GPU-плагин + `pyopenvino` + `ov_gpu_func_tests`); `get_available_devices()=['GPU.0','GPU.1']`. **Функц. тесты** (`*TensorParallel*`): **24/35 passed, 11 failed**. Из падений **10** — pre-existing ограничения GPU-плагина на stateful-моделях теста (воспроизведены на stock upstream `2026.5.0-22967` **без TP**): (1) `ReadValue`+`Add` при rank-3 state с «средней» осью >2 → `Argument shapes are inconsistent`; (2) stateful rank-3 depthwise `GroupConvolution` → фильтры ранга 5, несовпадение; (3) динамическое состояние `query_state()` даёт batch `0`. **1** — реальный TP-баг: `build_output_ports()` не переносит имена выходных тензоров на синтетический ALL_GATHER-порт → `get_tensor("logits")`/GenAI name-binding падает (не фиксить в test-only сессии; в `NEXT-FEATURES.md`). **Подтверждено на железе**: паритет TP2 vs 1-GPU для S05/S06/S07(N-split)/S08(K-split+ring)/S09(int4), scheduler (S14), конкуренция (S12), export/import несostatey (S16), GenAI-конфиг. **Перф**: `tp_bench.py` (indicative `decode_step_proxy`, GenAI нет): TP1=0.0512 s, TP2=0.0643 s → `TP1/TP2=0.80` (<1.5); MULTI — `AUTO не поддерживает stateful`. Профиль TP2: rank0=20.3 ms, rank1=20.2 ms node-time, wall≈64 ms → ≈24 ms/шаг staging/overhead. **GATE**: корректность ядра — зелёная; stateful-паритет — не проверен; перф-порог — **не достигнут**. См. `docs/notes/s16-perf-matrix.md` |
 
 ## Блокеры / открытые вопросы
+- **Обновлено (2026-10-18): сборка OpenVINO БОЛЬШЕ НЕ блокер.** Сабмодули инициализированы
+  (`git submodule update --init --recursive`), собрана Release-OpenVINO с GPU-плагином, Python-биндингами
+  и `ov_gpu_func_tests`; 2× Arc A770 видны (`['GPU.0','GPU.1']`). Функц. тесты и `tp_bench.py` прогнаны
+  (см. журнал гейтов «S16 hardware validation»). Остаточные блокеры ниже.
+- **Перф-GATE не достигнут (подтверждено на железе).** Без `openvino_genai` реальные TTFT/TPOT не сняты;
+  indicative proxy показал `TP1/TP2 = 0.80` (TP2 медленнее). Причина — pre-existing потолок: реальный Qwen
+  преимущественно REPLICATED + host-USM staging (G0), peer на A770 недоступен (`zeDeviceCanAccessPeer`=false).
+  Достижение `TPOT≥1.5×/TTFT≥1.3×` требует follow-up (in-graph коллективы, снятие REPLICATED, peer) — S17.
+- **Реальный TP-баг: потеря имён выходных тензоров (S13/GenAI).** `build_output_ports()` создаёт
+  синтетический full-shape порт для ALL_GATHER-выходов без переноса `get_names()`; `get_tensor(name)` и
+  name-based binding GenAI для all-gathered выходов (в т.ч. head-sharded state) падают
+  (`GenAiStyleStatefulRoundtripMatchesSingleGpu`). Фикс — в `NEXT-FEATURES.md` (S17), вне test-only сессии.
+- **Stateful-паритет TP не проверен.** 10 из 11 падений `*TensorParallel*` вызваны pre-existing
+  ограничениями GPU-плагина на stateful-моделях теста (rank-3 state `Add`/`GroupConvolution`, dynamic batch
+  reporting), воспроизведены на stock upstream без TP. Нужны правки тест-моделей (иные формы / явный init)
+  или фикс плагина — вне test-only сессии (S17).
 - **S16 GATE частичный (2026-10-18) — финал проекта.** Per-rank blob-cache (export/import конверта рангов),
   финальные доки и план upstream-серии готовы, тесты S16 написаны, но **сборка OpenVINO недоступна**
   (сабмодули пусты) и **2× GPU/GenAI на сборочной машине нет** → прогон `tensor_parallel` (S05–S16) и
@@ -106,6 +124,36 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S16 hardware validation done (2026-10-18) — сборка + прогон на 2× A770.** Факты и детали:
+  - **Сборка**: `cmake -G Ninja -S . -B build_tp -DCMAKE_BUILD_TYPE=Release -DENABLE_INTEL_GPU=ON
+    -DENABLE_INTEL_NPU=OFF -DENABLE_PYTHON=ON -DENABLE_TESTS=ON -DENABLE_SAMPLES=OFF
+    -DENABLE_OV_ONNX_FRONTEND=OFF`; цели `ov_gpu_func_tests` и `pyopenvino`. Запуск Python:
+    `PYTHONPATH=<build>/bin/intel64/Release/python`, `OPENVINO_LIB_PATHS=<build>/bin/intel64/Release`.
+    **Грабли**: `storage.openvinotoolkit.org` (TBB-архив) сначала отдавал ~30 B/s/`status 56` → помогло
+    **повторное скачивание** (`curl -4`), после чего CMake подхватил архив. Тест-бинарь — **`ov_gpu_func_tests.exe`**
+    (цель `ov_gpu_func_tests`, НЕ `ov_intel_gpu_behavior_tests`).
+  - **Функц. тесты** (`--gtest_filter=*TensorParallel*`): **24/35 passed**. Зелёные — паритет/шардинг:
+    S04 (compile/negatives), S05 parity, S06 seams, S07 N-split, S08 K-split, **S15 ring-детерминизм**,
+    S09 int4, **S14 scheduler**, **S12 concurrent**, S13 config, S16 export/import (несostatey) + guards.
+    **Красные (11)**: 10 — pre-existing ограничения GPU-плагина на stateful-моделях (rank-3 state
+    `Add`/`GroupConvolution`, dynamic batch `0`), 1 — реальный TP-баг имён выходов (`build_output_ports`).
+    Классификация проверена контрольными репро **на stock upstream `2026.5.0-22967`** (те же падения без TP).
+  - **Перф** (`tp_bench.py`, indicative proxy, GenAI нет): TP1=51.2 ms, TP2=64.3 ms (TP1/TP2=0.80),
+    MULTI не поддержан (AUTO+stateful). Профиль TP2: rank0=20.3/rank1=20.2 ms node-time, wall≈64 ms.
+    GATE-отношения на proxy не считаются → перф-GATE частичный (потолок REPLICATED + host-staging G0).
+  - **Харнесс-фикс** `tools/tp_bench/tp_bench.py::_measure_step_proxy`: (а) dynamic-dim гейт
+    (`d.is_static` вместо падающего `get_length()`), (б) типы через `ov.Type.i64/i32` (а не строку),
+    (в) `set_tensor(port, ov.Tensor)` вместо `set_input_tensors(dict)`. Без него proxy не запускался на
+    реальной LM.
+  - **Рабочее дерево на старте сессии**: в незакоммиченном виде находились build-fix правки TP-кода
+    (`tp_peer.cpp` — guard `OV_GPU_WITH_ZE_RT`; `tp_shard_transform.cpp` — `v0::Softplus`→`v4::SoftPlus`;
+    `tp_infer_request.cpp` — `get_tensors(output)`→`{}`; `tensor_parallel.cpp` — `.as<...>()` API-адаптации).
+    Они нужны для сборки/тестов и **вошли в этот commit** (не авторизованы этой сессией — при ревью
+    учитывать как внешнюю работу).
+  - **S17 (follow-up)**: (1) фикс имён выходных тензоров; (2) in-graph межранговые коллективы + снятие
+    REPLICATED для реального спид-апа; (3) peer-бэкенд для платформ с `zeDeviceCanAccessPeer`=true;
+    (4) правка/починка stateful тест-моделей или плагина. Перф-замер с `openvino_genai` — обязателен
+    для закрытия GATE. См. `NEXT-FEATURES.md`.
 - **S16 done (частично, 2026-10-18) — ПРОЕКТ ЗАВЕРШЁН.** Stage 5.2 стабилизация: per-rank blob-cache + финальные доки + план upstream-серии. Артефакты/решения:
   - **Per-rank blob-cache — зачем**: раньше `TPCompiledModel::export_model` бросал NOT_IMPLEMENTED →
     `CoreImpl::compile_model_and_cache` ловил исключение и **удалял cache-entry** → TP-кэш молча отключался

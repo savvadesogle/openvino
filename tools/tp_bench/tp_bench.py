@@ -138,6 +138,7 @@ def _measure_step_proxy(core, model_path: str, device: str, props: dict,
     declared ports, which is enough to compare scaling across TP1/TP2/MULTI before S15.
     """
     import numpy as np
+    import openvino as ov
 
     model = core.read_model(model_path)
     compiled = core.compile_model(model, device, props)
@@ -146,14 +147,21 @@ def _measure_step_proxy(core, model_path: str, device: str, props: dict,
     inputs = compiled.inputs
     input_tensors = {}
     for port in inputs:
-        shape = [d.get_length() if hasattr(d, "get_length") else int(d) for d in port.get_partial_shape()]
-        shape = [int(s) if isinstance(s, int) and s > 0 else 1 for s in shape]
-        et = port.get_element_type
-        np_dtype = np.int64 if str(et) in ("i64",) else (np.int32 if str(et) in ("i32",) else np.float32)
-        input_tensors[port] = np.zeros(shape, dtype=np_dtype)
+        # Dynamic dimensions (e.g. the sequence axis of a decoder) are pinned to 1 so a
+        # single decode step can be timed; get_length() raises on dynamic dims, so gate it.
+        pshape = port.get_partial_shape()
+        shape = [int(d.get_length()) if d.is_static else 1 for d in pshape]
+        shape = [s if s > 0 else 1 for s in shape]
+        et = port.get_element_type()
+        np_dtype = np.int64 if et == ov.Type.i64 else (np.int32 if et == ov.Type.i32 else np.float32)
+        input_tensors[port] = ov.Tensor(np.zeros(shape, dtype=np_dtype))
+
+    def _set_inputs() -> None:
+        for port, tensor in input_tensors.items():
+            request.set_tensor(port, tensor)
 
     def _one_step() -> float:
-        request.set_input_tensors(input_tensors)
+        _set_inputs()
         t0 = time.perf_counter()
         request.infer()
         return time.perf_counter() - t0
