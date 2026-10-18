@@ -7,6 +7,7 @@
 #include "device.hpp"
 #include "engine_configuration.hpp"
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <algorithm>
@@ -52,5 +53,14 @@ struct lightweight_device {
 // Cheap device enumeration for pre-construction dispatch: lists the devices this build's
 // runtime can serve with device_info populated, WITHOUT building an engine/context.
 std::vector<lightweight_device> lightweight_enumerate() noexcept;
+
+// [TP-GPU, S15] Runtime probe of cross-device peer access for tensor-parallel collectives.
+// Returns true iff the first @p count enumerated Intel GPUs can DIRECTLY access each other's
+// memory (Level Zero `zeDeviceCanAccessPeer` for every ordered i != j pair). The tensor-parallel
+// transport (TPTransport) uses this to select the peer fast-path over host-USM staging (GATE G0).
+// Returns false when fewer than two devices are visible, Level Zero is unavailable/resolves no
+// peer query, or any cross pair lacks peer access (the common case on 2x Arc A770, S02/S03).
+// Result is cached per @p count; never throws.
+bool gpu_devices_peer_accessible(size_t count);
 
 }  // namespace cldnn

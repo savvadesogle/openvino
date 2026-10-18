@@ -40,7 +40,11 @@
 // S14: rank scheduler - the k rank sub-requests are dispatched in parallel on a shared k-stream
 //      executor (one rank per device); several overlapping async requests plus a repeated
 //      synchronous infer must still match single-GPU inference deterministically.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S14).
+// S15: perf fast-paths for the collectives - a real `zeDeviceCanAccessPeer` probe selects the
+//      PEER transport when available (host-USM staging otherwise, as on 2x A770), and the
+//      all-reduce uses a ring reduce-scatter + all-gather (still fp32, replicated terms once).
+//      The ring must stay deterministic across repeated inference and keep matching single-GPU.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S15).
 
 #include <algorithm>
 #include <cmath>
@@ -810,6 +814,81 @@ TEST_F(TensorParallelCompileGPU, KsplitNotDivisibleFallsBackToReplica) {
     ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
     EXPECT_GT(cosine_similarity(ref_output, tp_output), 0.999);
     ov::test::utils::compare(ref_output, tp_output, 1e-3f, 1e-3f);
+}
+
+// [S15] The ring all-reduce must be deterministic: repeated inference on the same request and a
+// fresh request must produce bit-identical full-shape outputs (the ring's fixed chunk order),
+// while still matching the single-GPU reference (fp32 accumulation, replicated term once).
+TEST_F(TensorParallelCompileGPU, KsplitRingAllReduceDeterministicAcrossRuns) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_ksplit_residual_model();
+    auto tp_model = ref_model->clone();
+
+    ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+    {
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = static_cast<float>(i) * 0.25f - 1.0f;
+        }
+    }
+    ov::Tensor residual(ov::element::f32, ov::Shape{1, 16});
+    {
+        auto* data = residual.data<float>();
+        for (size_t i = 0; i < 16; ++i) {
+            data[i] = 0.125f * static_cast<float>((i % 3) + 1);
+        }
+    }
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    auto ref_request = ref_compiled.create_infer_request();
+    ref_request.set_input_tensor(0, input);
+    ref_request.set_input_tensor(1, residual);
+    ref_request.infer();
+    const ov::Tensor ref_output = ref_request.get_output_tensor();
+
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, {ov::hint::model_distribution_policy(tp_policy)});
+
+    // This model is classified K_SPLIT with an all-reduce output seam (ring all-reduce path).
+    auto output_seams = tp_compiled.get_property(ov::intel_gpu::tp_output_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(output_seams.size(), 1u) << "Expected exactly one all-reduce output seam";
+    EXPECT_EQ(output_seams[0].rfind("ALL_REDUCE_SUM:", 0), 0u) << "Unexpected output seam: " << output_seams[0];
+
+    auto tp_request = tp_compiled.create_infer_request();
+    tp_request.set_input_tensor(0, input);
+    tp_request.set_input_tensor(1, residual);
+    tp_request.infer();
+    const ov::Tensor first = tp_request.get_output_tensor();
+    std::vector<float> first_data(first.get_size());
+    std::copy_n(first.data<float>(), first.get_size(), first_data.begin());
+
+    // Repeated inference on the same request must be bit-identical (deterministic ring order).
+    for (int run = 0; run < 3; ++run) {
+        tp_request.infer();
+        const ov::Tensor again = tp_request.get_output_tensor();
+        ASSERT_EQ(again.get_size(), first_data.size());
+        for (size_t i = 0; i < first_data.size(); ++i) {
+            EXPECT_FLOAT_EQ(first_data[i], again.data<float>()[i])
+                << "Ring all-reduce is not deterministic at index " << i << " (run " << run << ")";
+        }
+    }
+
+    // A fresh request must also be bit-identical and match single-GPU inference.
+    auto fresh_request = tp_compiled.create_infer_request();
+    fresh_request.set_input_tensor(0, input);
+    fresh_request.set_input_tensor(1, residual);
+    fresh_request.infer();
+    const ov::Tensor fresh = fresh_request.get_output_tensor();
+    ASSERT_EQ(fresh.get_shape(), ref_output.get_shape());
+    EXPECT_GT(cosine_similarity(ref_output, fresh), 0.999);
+    ov::test::utils::compare(ref_output, fresh, 1e-3f, 1e-3f);
+    for (size_t i = 0; i < first_data.size(); ++i) {
+        EXPECT_FLOAT_EQ(first_data[i], fresh.data<float>()[i]) << "Fresh request diverged at index " << i;
+    }
 }
 
 // [S09] GATE: N-split of an int4_ASYM group-quantized projection. Each rank holds only its

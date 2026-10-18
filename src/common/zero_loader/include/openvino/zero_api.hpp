@@ -101,6 +101,7 @@ namespace ov {
     symbol_statement(zeInitDrivers)                           \
     symbol_statement(zelGetLoaderVersion)                     \
     symbol_statement(zelSetDriverTeardown)                    \
+    symbol_statement(zeDeviceCanAccessPeer)                   \
     symbol_statement(zeDeviceGetRuntimeRequirements)          \
     symbol_statement(zeDeviceGetRuntimeRequirementsKey)       \
     symbol_statement(zeDeviceValidateRuntimeRequirements)     \

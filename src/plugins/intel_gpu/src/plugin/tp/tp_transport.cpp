@@ -1,17 +1,24 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S12] Experimental GPU tensor-parallel support.
-// Host-USM staging transport for inter-rank collectives. See tp_transport.hpp and
-// docs/notes/l0-spike.md §8 (GATE G0: the only working inter-device path is host staging).
+// [TP-GPU, S12/S15] Experimental GPU tensor-parallel support.
+// Inter-rank transport for collectives. S12: host-USM staging (GATE G0: the only working
+// inter-device path on 2x Arc A770, docs/notes/l0-spike.md §8). S15: real `zeDeviceCanAccessPeer`
+// probe selecting the PEER fast-path when available, and a ring reduce-scatter + all-gather
+// all-reduce (fp32, replicated terms once) instead of the previous "everyone -> rank0 -> everyone"
+// host sum. See tp_transport.hpp and docs/notes/s15-perf-report.md.
 
 #include "intel_gpu/plugin/tp/tp_transport.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <utility>
 
+#include "intel_gpu/runtime/device_query.hpp"
 #include "openvino/core/except.hpp"
 #include "openvino/core/type/bfloat16.hpp"
 #include "openvino/core/type/float16.hpp"
@@ -231,28 +238,95 @@ void accumulate_scaled_broadcast(std::vector<float>& acc,
     }
 }
 
+//! [S15] Ring all-reduce(sum) over the per-rank fp32 partials: reduce-scatter (k-1 steps; each rank
+//! forwards one chunk to its successor and accumulates the chunk received from its predecessor in
+//! fp32) followed by all-gather (k-1 steps). Afterwards every rank holds the full sum; rank 0's
+//! buffer is returned. Requires S divisible by k (callers fall back to the host sum otherwise).
+//! Payload moved per rank = 2*(k-1)/k*S, i.e. for k=2 a single S-element arm in each direction,
+//! halving the critical-path latency of the previous "everyone -> rank0 -> everyone" scheme (2S).
+void ring_all_reduce_fp32(const std::vector<std::vector<float>>& partials,
+                          std::vector<float>& out,
+                          size_t& messages,
+                          size_t& bytes) {
+    const size_t k = partials.size();
+    const size_t elements = partials.front().size();
+    const size_t chunk = elements / k;
+    std::vector<std::vector<float>> buffers = partials;  // each rank's working buffer
+
+    messages = 0;
+    bytes = 0;
+    std::vector<float> msg(k * chunk);
+
+    // Reduce-scatter: after k-1 steps rank r owns the fully reduced chunk (r + 1) % k.
+    for (size_t step = 0; step + 1 < k; ++step) {
+        for (size_t r = 0; r < k; ++r) {
+            const size_t idx = (r + k - step) % k;
+            std::copy_n(buffers[r].data() + idx * chunk, chunk, msg.data() + r * chunk);
+        }
+        for (size_t r = 0; r < k; ++r) {
+            const size_t src = (r + k - 1) % k;
+            const size_t recv_idx = (r + k - step - 1) % k;
+            float* dst = buffers[r].data() + recv_idx * chunk;
+            const float* incoming = msg.data() + src * chunk;
+            for (size_t j = 0; j < chunk; ++j) {
+                dst[j] += incoming[j];
+            }
+        }
+        messages += k;
+        bytes += k * chunk * sizeof(float);
+    }
+
+    // All-gather: rank r forwards the chunk it currently owns; after k-1 steps every chunk is known.
+    for (size_t step = 0; step + 1 < k; ++step) {
+        for (size_t r = 0; r < k; ++r) {
+            const size_t idx = (r + k + 1 - step) % k;
+            std::copy_n(buffers[r].data() + idx * chunk, chunk, msg.data() + r * chunk);
+        }
+        for (size_t r = 0; r < k; ++r) {
+            const size_t src = (r + k - 1) % k;
+            const size_t idx = (src + k + 1 - step) % k;
+            std::copy_n(msg.data() + src * chunk, chunk, buffers[r].data() + idx * chunk);
+        }
+        messages += k;
+        bytes += k * chunk * sizeof(float);
+    }
+
+    out = std::move(buffers.front());  // rank 0 holds the full sum
+}
+
 }  // namespace
 
-const TPTransportCapabilities& tp_transport_capabilities() {
-    // S02/S03: on the target machine (2x Arc A770, Windows, L0 1.33.1) `zeDeviceCanAccessPeer`
-    // is false across devices, IPC memory is UNSUPPORTED_FEATURE and IPC events are unavailable,
-    // so the only working inter-device path is host-USM staging (GATE G0). The peer probe below
-    // is the runtime fast-path hook: a plugin-level `zeDeviceCanAccessPeer` query would flip
-    // `peer_available` here (S15). It is intentionally conservative (no false positives).
-    static const TPTransportCapabilities caps = [] {
-        TPTransportCapabilities c;
-        c.kind = TPTransportKind::HOST_STAGING;
-        c.peer_available = false;
-        c.ipc_available = false;
-        c.reason = "host-USM staging (G0): peer access and IPC memory/events unavailable on this platform (S02/S03)";
-        return c;
-    }();
-    return caps;
+const TPTransportCapabilities& tp_transport_capabilities(size_t num_ranks) {
+    // [S15] Probes the inter-rank transport once per group size. `gpu_devices_peer_accessible`
+    // queries Level Zero `zeDeviceCanAccessPeer` across the first `num_ranks` enumerated Intel
+    // GPUs (never throws). On the target machine (2x Arc A770, Windows, L0 1.33.1) peer access is
+    // false across devices, IPC memory is UNSUPPORTED_FEATURE and IPC events are unavailable, so
+    // the only working inter-device path is host-USM staging (GATE G0); the result is cached and
+    // is deliberately conservative (a true PEER result requires every cross pair to have access).
+    static std::mutex mutex;
+    static std::map<size_t, TPTransportCapabilities> cache;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    auto cached = cache.find(num_ranks);
+    if (cached != cache.end()) {
+        return cached->second;
+    }
+
+    TPTransportCapabilities caps;
+    caps.peer_available = cldnn::gpu_devices_peer_accessible(num_ranks);
+    caps.ipc_available = false;  // S02: IPC memory/events are UNSUPPORTED_FEATURE on Windows
+    caps.kind = caps.peer_available ? TPTransportKind::PEER : TPTransportKind::HOST_STAGING;
+    caps.reason = caps.peer_available
+                      ? "peer fast-path: zeDeviceCanAccessPeer across all rank pairs (S15)"
+                      : "host-USM staging (G0): peer access and IPC memory/events unavailable on this platform (S02/S03)";
+    return cache.emplace(num_ranks, std::move(caps)).first->second;
 }
 
-TPTransport::TPTransport(size_t num_ranks) : m_num_ranks(std::max<size_t>(1, num_ranks)) {
-    m_capabilities = tp_transport_capabilities();
-}
+TPTransport::TPTransport(size_t num_ranks) : TPTransport(num_ranks, tp_transport_capabilities(num_ranks)) {}
+
+TPTransport::TPTransport(size_t num_ranks, TPTransportCapabilities capabilities)
+    : m_num_ranks(std::max<size_t>(1, num_ranks)),
+      m_capabilities(std::move(capabilities)) {}
 
 void TPTransport::all_gather_axis(const std::vector<Tensor>& slices, const Tensor& full, size_t axis) const {
     OPENVINO_ASSERT(full, "[GPU][TP] all_gather: null full tensor");
@@ -264,6 +338,10 @@ void TPTransport::all_gather_axis(const std::vector<Tensor>& slices, const Tenso
                     slices.size(), " ranks");
     const size_t count = full_shape[axis] / slices.size();
     for (size_t r = 0; r < slices.size(); ++r) {
+        // [S15] PEER fast-path (direct device copy) when available; host staging otherwise (G0).
+        if (use_peer() && m_peer_region_copy(slices[r], full, axis, r * count, count)) {
+            continue;
+        }
         copy_axis_region(slices[r], full, axis, r * count, count);
     }
 }
@@ -278,6 +356,10 @@ void TPTransport::scatter_axis(const Tensor& full, size_t axis, const std::vecto
                     slices.size(), " ranks");
     const size_t count = full_shape[axis] / slices.size();
     for (size_t r = 0; r < slices.size(); ++r) {
+        // [S15] PEER fast-path (direct device copy) when available; host staging otherwise (G0).
+        if (use_peer() && m_peer_region_copy(full, slices[r], axis, r * count, count)) {
+            continue;
+        }
         extract_axis_region(full, slices[r], axis, r * count, count);
     }
 }
@@ -291,17 +373,38 @@ void TPTransport::all_reduce_sum_fp32(const std::vector<Tensor>& partials,
     const size_t out_size = full->get_size();
     const auto out_shape = full->get_shape();
 
-    // 1) Sum every rank's partial GEMM output in fp32 (PLAN §7.4: no fp16 summation). Reuse the
-    //    transport-owned staging accumulator instead of allocating a fresh vector per inference.
+    // 1) Reduce every rank's partial GEMM output in fp32 (PLAN §7.4: no fp16 summation). [S15]
+    //    Ring reduce-scatter + all-gather when the element count is divisible by the rank count
+    //    (the standard case); otherwise fall back to the previous host sum into the reusable
+    //    staging accumulator. Both keep full fp32 accumulation.
+    const size_t num_ranks = partials.size();
+    // Reuse the transport-owned staging accumulator (grown on demand, never shrunk).
     std::vector<float>& acc = m_staging;
-    acc.assign(out_size, 0.0f);
-    for (size_t r = 0; r < partials.size(); ++r) {
-        auto partial = tensor_to_floats(partials[r]);
-        OPENVINO_ASSERT(partial.size() == out_size,
-                        "[GPU][TP] K-split partial output shape mismatch on rank ", r);
-        for (size_t j = 0; j < out_size; ++j) {
-            acc[j] += partial[j];
+    if (num_ranks > 1 && out_size % num_ranks == 0) {
+        std::vector<std::vector<float>> buffers;
+        buffers.reserve(num_ranks);
+        for (size_t r = 0; r < num_ranks; ++r) {
+            buffers.push_back(tensor_to_floats(partials[r]));
+            OPENVINO_ASSERT(buffers.back().size() == out_size,
+                            "[GPU][TP] K-split partial output shape mismatch on rank ", r);
         }
+        std::vector<float> reduced;
+        ring_all_reduce_fp32(buffers, reduced, m_all_reduce_stats.messages, m_all_reduce_stats.bytes);
+        acc = std::move(reduced);
+        m_all_reduce_stats.algorithm = TPAllReduceAlgorithm::RING;
+    } else {
+        acc.assign(out_size, 0.0f);
+        for (size_t r = 0; r < num_ranks; ++r) {
+            auto partial = tensor_to_floats(partials[r]);
+            OPENVINO_ASSERT(partial.size() == out_size,
+                            "[GPU][TP] K-split partial output shape mismatch on rank ", r);
+            for (size_t j = 0; j < out_size; ++j) {
+                acc[j] += partial[j];
+            }
+        }
+        m_all_reduce_stats.algorithm = TPAllReduceAlgorithm::HOST_SUM;
+        m_all_reduce_stats.messages = 0;
+        m_all_reduce_stats.bytes = 0;
     }
 
     // 2) Replicated bias/residual terms are present once per rank: subtract the (num_ranks - 1)

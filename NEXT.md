@@ -1,31 +1,31 @@
-# СЕССИЯ S15 — Stage 5.1 перф: peer-копии + ring/tree allreduce, prefill/decode отчёт (закрытие GATE TPOT ≥ 1.5×) · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
+# СЕССИЯ S16 — Stage 5.2 стабилизация: per-rank blob-cache, финальные доки, upstream-серия · Проект TP-GPU: Tensor Parallel на GPU в OpenVINO
 
 ## Как работать
 Сначала полностью прочитай:
-1. `C:\openvino-tp\PLAN.md` — канон (НЕ редактировать в сессии), особенно §4.4 (runtime:
-   `TPCompiledModel`/`TPInferRequest`, выходы с ранга 0; коллективы — OpenCL-ядра через
-   `custom_gpu_primitive`, fp32-аккум, staging peer-device при `zeDeviceCanAccessPeer`, иначе USM host),
-   §5 (строка S15: «Stage 5.1 перф: peer-копии, ring/tree allreduce | prefill/decode отчёт»),
-   §6 (перф: TPOT/TTFT TP2/TP1 ≥ 1.5/1.3), §7 (риски: fp16-суммы → fp32; фьюжны не пересекают швы).
-2. `C:\openvino-tp\STATE.md` — особенно новый блок **S14 done** в «Заметки сессия → следующая»,
-   а также S12 (`TPTransport` host-USM staging, конкурентность), S13 (GenAI-путь, REPLICATED-ожидание),
-   S08/S09 (K-split + host reducer, fp32). «Блокеры» → S14 GATE частичный.
-3. `C:\openvino-tp\docs\notes\tp-bench-plan.md` — **бенч-план S14** (метрики TTFT/TPOT, окружение
-   2×A770 vs 2×BMG, команды `tools/tp_bench/tp_bench.py`, критерии, профиль узких мест).
-4. `C:\openvino-tp\docs\notes\l0-spike.md` §3/§8 — capability-матрица (peer=false, IPC mem/event NA)
-   и микро-полосы (host staging ~4–5 GB/s e2e, ~60–90 µs host-sync floor). **Сверить перед перфом.**
-5. `C:\openvino-tp\docs\notes\gpu-plugin-arch.md` §3–§4 — очереди/события/`network::execute` (как
-   публиковать/ждать в device-side швах), §6 (ограничители cldnn = 1 device).
+1. `C:\openvino-tp\PLAN.md` — канон (НЕ редактировать в сессии), особенно §4.2 (per-rank blob-cache/
+   upload до `propagate_constants`), §4.4 (runtime: `TPCompiledModel`/`TPInferRequest`, коллективы),
+   §5 (строка S16: «Stage 5.2 стабилизация | blob-cache per-rank, docs, upstream-серии»),
+   §6 (перф-матрица: TPOT/TTFT TP2/TP1 ≥ 1.5/1.3, память без дублирования весов),
+   §7 (риски: fp16-суммы → fp32; фьюжны не пересекают швы), §8 (upstream-план/серия PR).
+2. `C:\openvino-tp\STATE.md` — новый блок **S15 done** в «Заметки сессия → следующая», плюс S14
+   (scheduler + бенч-обвязка), S12 (`TPTransport`, host-USM staging, конкурентность), S13 (GenAI-путь),
+   S08/S09 (K-split + host reducer, fp32), «Гейт-решения» S01–S15, «Блокеры» (S15 GATE частичный).
+3. `C:\openvino-tp\docs\notes\s15-perf-report.md` — трафик-модель (ring), prefill/decode-профиль,
+   чек-лист прогона, GATE-решение S15 (**читай перед S16**).
+4. `C:\openvino-tp\docs\notes\tp-bench-plan.md` — бенч-план S14 (метрики TTFT/TPOT, окружение, команды,
+   критерии, профиль узких мест); `tools/tp_bench/tp_bench.py` + `README.md`.
+5. `C:\openvino-tp\docs\notes\gpu-plugin-arch.md` §5–§6 — how-to точной вставки в upload/blob-cache
+   (кэш моделей/`CreateModelEngine`, per-rank `ExecutionConfig`, ограничители cldnn = 1 device).
 6. `C:\openvino-tp\docs\notes\cpu-tp-pattern.md` §5 — эталон allgather-механики (двойной буфер +
-   счётчик раунда) как идея пула staging-буферов по (seam, rank, iteration).
+   счётчик раунда) для пула staging-буферов по (seam, rank, iteration), если понадобится.
 
-Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = **S15** (таблица PLAN.md §5). Следующий
-этап (S16 стабилизация: blob-cache per-rank, docs, upstream-серии) ЗАПРЕЩЁН. Остановка на GATE/блокере —
-нормальный результат; зафиксируй его в STATE.md.
+Правило проекта: в этой сессии выполняется РОВНО ОДИН этап = **S16** (таблица PLAN.md §5). Более
+поздние этапы (upstream-PR вне описанной серии, новые фичи вне стабилизации) ЗАПРЕЩЕНЫ. Остановка
+на GATE/блокере — нормальный результат; зафиксируй его в STATE.md.
 
 ## Контекст, который УЖЕ исполнен (не повторять)
 - S01–S03: ветка `feature/gpu-tensor-parallel`; L0-спайки (2× A770; peer/IPC/кросс-shared USM NA);
-  **G0 = host-USM staging** (dev→pinned host→dev, ~4–5 GB/s e2e). Peer — только fast-path hook.
+  **G0 = host-USM staging** (dev→pinned host→dev, ~4–5 GB/s e2e, host-sync floor ~60–90 µs).
 - S04–S05: `TPCoordinator`/TP-ветка `compile_model`; `TPInferRequest` (k per-rank sub-запросов,
   реплика входов, выходы/состояние rank0); `create_infer_request()` → async-обёртка.
 - S06: `TPShardTransform` классифицирует seams; RO-property `tp_seams`.
@@ -36,66 +36,70 @@
 - S12: динамические state-шейпы; `TPTransport` (host-USM staging: `all_gather_axis`/`scatter_axis`/
   `all_reduce_sum_fp32`); конкурентность (`m_infer_mutex`/`m_output_mutex`).
 - S13: GenAI-путь (`docs/notes/genai-integration.md`); строковый GenAI-конфиг доходит до TP-ветки.
-- S14: **rank scheduler** — `TPInferRequest::schedule_ranks()` исполняет k рангов **параллельно** на
-  общем k-stream `ov::threading::IStreamsExecutor` из `TPCompiledModel` (`m_rank_executor`,
-  `get_rank_executor()`), через `ITaskExecutor::run_and_wait`; `replicate_inputs()` до fan-out,
-  `assemble_outputs()`/агрегация после всех рангов (детерминизм); тест
-  `SchedulerParallelRanksMatchSingleGpu`; бенч-харнесс `tools/tp_bench/tp_bench.py` + план
-  `docs/notes/tp-bench-plan.md`. Реальный Qwen по-прежнему преимущественно **REPLICATED** →
-  TPOT_ratio≈1.0; ≥1.5× не достигнут/не измерен.
+- S14: **rank scheduler** — `schedule_ranks()` (k-stream `m_rank_executor`), `replicate_inputs()` до
+  fan-out, `assemble_outputs()` после; бенч-харнесс `tools/tp_bench/tp_bench.py` + план.
+- S15: **peer-probe + ring allreduce**:
+  - `zeDeviceCanAccessPeer` в weak-symbols (`zero_api.hpp`); `cldnn::gpu_devices_peer_accessible(size_t)`
+    (`device_query.hpp` + `src/runtime/tp_peer.cpp`) — консервативная проба, не бросает;
+  - `tp_transport_capabilities(size_t)` (кэш по k, `kind=PEER` при peer-доступе); `TPTransport::PeerRegionCopy`
+    + `set_peer_region_copy()` (на A770 peer=false → ветка инертна, host-staging G0);
+  - `all_reduce_sum_fp32` → ring reduce-scatter + all-gather (`ring_all_reduce_fp32`, fp32, `S%k==0`,
+    иначе `HOST_SUM`); `last_all_reduce_stats()`;
+  - тест `KsplitRingAllReduceDeterministicAcrossRuns`; отчёт `docs/notes/s15-perf-report.md`.
+  - Реальный Qwen по-прежнему преимущественно **REPLICATED** → перф-GATE не подтверждён (см. блокер).
 
-## Задача S15 (полный объём этой сессии)
+## Задача S16 (полный объём этой сессии)
 
-Stage 5.1 — **перф-оптимизация межранговых коллективов + prefill/decode отчёт; цель — закрыть GATE
-TPOT ≥ 1.5× / TTFT ≥ 1.3×.** Точный объём:
+Stage 5.2 — **стабилизация и подготовка к upstream.** Точный объём:
 
-1. **Peer-копии (fast-path) вместо host-staging, где доступно.**
-   - В `TPTransport` (`tp_transport.{hpp,cpp}`) включи реальный PEER-путь при
-     `zeDeviceCanAccessPeer(dev_i, dev_j) == true` (`TPTransportCapabilities::peer_available`):
-     прямые device→device копии без pinned-host round-trip. На текущей машине (2×A770, S02) peer=false →
-     путь не активируется; код/ветка должны быть готовы и не ломать HOST_STAGING fallback.
-   - Сохрани единый интерфейс коллективов (`all_gather_axis`/`scatter_axis`/`all_reduce_sum_fp32`).
-     Публичные свойства/seams не менять.
-2. **Ring/tree allreduce.**
-   - Замени host-суммирование в `all_reduce_sum_fp32` на **ring- или tree-allreduce** (PLAN §4.4:
-     device-side ядра; на хосте — ring-схема через staging — приемлемо как MVP-перф). fp32-аккумуляция
-     обязательна (PLAN §7.4), replicated bias/residual — ровно один раз (как S08).
-   - Оцени алгоритмически: объём трафика ring vs текущий «все→rank0→все»; для k=2 показать выигрыш
-     (одно плечо вместо двух).
-3. **Staging-буферы per (seam, rank, iteration) — опционально** (если нужно для overlap):
-   идея двойной буферизации + счётчика раунда из `cpu-tp-pattern.md` §5. Не обязателен, если
-   single-request decode не страдает.
-4. **prefill/decode отчёт.**
-   - Прогон `tools/tp_bench/tp_bench.py` (или ручной сценарий из `tp-bench-plan.md`) на 2×A770 и/или
-     2×BMG: TTFT/TPOT TP1/TP2/MULTI. Зафиксировать окружение, warmup/iters/seqlen/greedy.
-   - Профиль TP2 (`get_profiling_info()` с префиксами `rankN:`): доля staging/коллективов vs compute.
-   - Записать в STATE перф-журнал + решение GATE. Если ≥1.5× недостижимо из-за REPLICATED —
-     честно зафиксировать потолок и что именно мешает (in-graph all-gather на coupled fused
-     `in_proj`/`Concat`/`Loop` — вероятно, требует in-graph коллективов, частично вне S15).
-5. **Не регрессировать S04–S14.**
-   - Паритеты S05/S07–S14, негативы S04, seams S06, TP-off == upstream, GenAI-тесты S13,
-     scheduler-тест S14.
-   - Fallback при неделимости/небезопасном потребителе → репликация БЕЗ throw (как S07–S14).
+1. **Per-rank blob-cache.**
+   - Кэш скомпилированных блобов должен быть **per (rank, device)**: ранги одного TP-группы не должны
+     переиспользовать чужой блоб (у каждого ранга — свои срезы весов и своя `ExecutionConfig`
+     `tp_rank`/`tp_num_ranks`, S07). Проверить и, где нужно, расширить ключ кэша
+     (`CreateModelEngine`/`m_model_cache` в `plugin.cpp`/`compiled_model.cpp`) полями rank/num_ranks
+     (или гарантировать раздельные блобы для TP-ранга). Зафиксировать решение в STATE (без изменения
+     публичного API и форматов существующих свойств).
+   - Не сломать обычный (не-TP) путь и MULTI: не-TP блоб-кэш — как раньше.
+2. **Документация.**
+   - Актуализировать/дописать доки в `docs/notes/` по итогам S04–S15: единая карта артефактов
+     (файлы, свойства, seam-форматы, тесты), ограничения (REPLICATED, host-staging G0, peer простаивает),
+     краткое «как запустить и что ожидать». Не создавать дублирующих доков; дельты — в существующие.
+3. **Upstream-серия.**
+   - Подготовить план разбиения изменений S04–S16 на серию независимо ревьюируемых коммитов/PR
+     (PLAN §8): выделить связные слайсы (свойства+coordinator → shard-transform → collectives/transport →
+     scheduler → state → GenAI → perf), для каждого — заголовок/объём/зависимости/тесты. Только план
+     (документ), **без push и без создания PR** (remote-политика).
+4. **Перф-матрица §6 (насколько доступно).**
+   - Прогнать `tools/tp_bench/tp_bench.py` на 2×A770 и/или 2×BMG, если среда позволяет; зафиксировать
+     TTFT/TPOT TP1/TP2/MULTI, окружение, warmup/iters/seqlen/greedy; записать в STATE перф-журнал.
+   - Если сборка/железо недоступны — не изобретать обходные сборки: зафиксировать блокер, GATE частичный
+     (матрица — по аналитике S15 + чек-лист `s15-perf-report.md` §7).
+5. **Не регрессировать S04–S15.**
+   - Паритеты S05/S07–S15, негативы S04, seams S06, TP-off == upstream, GenAI-тесты S13, scheduler S14,
+     ring-детерминизм S15.
+   - Fallback при неделимости/небезопасном потребителе → репликация БЕЗ throw (как S07–S15).
 
-## GATE S15 (критерии завершения)
-- `TPTransport` умеет PEER fast-path (активируется по `zeDeviceCanAccessPeer`); HOST_STAGING не сломан.
-- allreduce — ring/tree (не «все→rank0→все»); fp32-аккум сохранён; bias/residual один раз.
-- Есть prefill/decode отчёт (реальный прогон ИЛИ план+профиль) с решением по TPOT/TTFT.
-- Либо GATE TPOT ≥ 1.5× / TTFT ≥ 1.3× достигнут, **либо** частичный GATE с оценкой потолка
-  (REPLICATED/staging) и передачей остатка в S16.
-- STATE.md: S15 done/блокер + артефакты + перф-числа + заметки → S16.
-- NEXT.md — полный самодостаточный промпт S16 (стабилизация: blob-cache per rank по (rank, device),
-  docs/upstream-серии, матрица §6 зелень).
-- Commit (сообщение: "S15: peer copies + ring allreduce + prefill/decode report") — **локально, без push**.
+## GATE S16 (критерии завершения)
+- Blob-cache корректен для TP (per-rank): ранги не делят чужой блоб; не-TP путь не изменён.
+- Доки по S04–S16 актуальны (карта артефактов + ограничения + запуск/ожидания).
+- Готов план upstream-серии (слайсы/заголовки/зависимости/тесты) — документ, без push/PR.
+- Есть перф-матрица (реальный прогон ЛИБО аналитика+чек-лист) с решением по §6.
+- Либо GATE §6 зелёный, **либо** частичный GATE с честной оценкой потолка (REPLICATED/staging) и
+  явным списком остатка.
+- STATE.md: S16 done/блокер + артефакты + перф-числа + заметки (финал проекта).
+- NEXT.md — финальный самодостаточный промпт (если проект завершается — явное «проект завершён» +
+  чек-лист для возобновления на железе).
+- Commit (сообщение: "S16: per-rank blob-cache + docs + upstream series plan") — **локально, без push**.
 
 ## Жёсткие ограничения
 - **Только локально: remote (origin/upstream) НЕ трогаем** — никаких push/pull/изменений удалённого
-  репозитория, включая `git submodule update` (сетевой fetch).
-- Атомарность этапа: НЕ реализовывать S16 (blob-cache per-rank, upstream-серии, финальные docs-матрицы).
+  репозитория, включая `git submodule update` (сетевой fetch); PR не создавать.
+- Атомарность этапа: НЕ реализовывать фичи вне стабилизации (in-graph коллективы и т.п. — отдельные
+  будущие этапы, только в плане upstream-серии).
 - Не коммитить `.bin`/модельные файлы; секреты не писать; `.bin` (4.6 GB) не читать целиком.
 - `PLAN.md` в сессии не редактировать; дельты — в STATE.md.
 - **Форматирование**: репо пинует clang-format-18, в среде только clang-format 20.1.0 →
   whole-file прогон даёт массовый churn. **Не запускать clang-format**; стиль вручную.
 - Попутные находки — в STATE «Заметки сессия → следующая» или `docs/notes/`.
 - Если сборка OpenVINO недоступна (сабмодули пусты) или нет 2 GPU — не изобретать обходные сборки;
-  зафиксировать блокер в STATE и считать GATE частичным (peer/ring-код + профиль/план готовы).
+  зафиксировать блокер в STATE и считать GATE частичным.
