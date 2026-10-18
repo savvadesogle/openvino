@@ -26,7 +26,7 @@
 - [x] S10 Stage3.1 per-rank KV + state aggregation (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S11 Stage3.2 linear_attention (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S12 Stage3.3 Hard (2026-10-18; код+тест готовы, GATE частичный — сборка недоступна)
-- [ ] S13 Stage4.1 GenAI интеграция
+- [x] S13 Stage4.1 GenAI интеграция (2026-10-18; обвязка+тесты+док, GATE частичный — сборка/GenAI/2 GPU недоступны)
 - [ ] S14 Stage4.2 Scheduler + бенч
 - [ ] S15 Stage5.1 перф
 - [ ] S16 Stage5.2 стабилизация
@@ -53,7 +53,15 @@
 
 | 2026-10-18 | S12 Stage3.3 Hard (dynamic/transport/concurrency) | **частично** (код+тест готовы) | **Динамические state-шейпы**: `TPStateSeam.full_shape` переведён `ov::Shape`→`ov::PartialShape` (`tp_plan.hpp`); `TPShardTransform::find_state_head_axis` принимает `PartialShape` и требует, чтобы head-ось была **статической и делимой** (`axis.is_static() && get_length()%num_ranks==0`), а `analyze_state_variable` пропускает динамический ранг/динамические внутренние оси (`rank().is_dynamic()` — REPLICATED без throw), вместо прежнего отклонения «dynamic state shape». Шардинг: `sharded[axis]=ov::Dimension(full_dim/num_ranks)` при сохранении динамики batch/seq, затем `update_data_shape(sharded)`+`validate_nodes_and_infer_types()`. Это снимает барьер для всех реальных Qwen-состояний `?,4,?,256`/`?,8192,4`/`?,32,128,128` (но сами они по-прежнему REPLICATED — потребители не head-local, см. S10/S11). **Межранговый транспорт**: новый `TPTransport` (`tp_transport.hpp/.cpp`) — host-USM staging (G0): reusable pinned-host staging-буфер, коллективы `all_gather_axis`/`scatter_axis`/`all_reduce_sum_fp32` (fp32-аккумуляция + «term один раз»), capabilities-probe фиксирует `HOST_STAGING`/peer=false/ipc=false (S02/S03), PEER — только runtime fast-path hook (S15). Перенесённые хелперы (`copy_axis_region`/`extract_axis_region`/`tensor_to_floats`/`floats_to_tensor`/`row_major_strides`/`accumulate_scaled_broadcast`) вынесены из `tp_infer_request.cpp` в транспорт. `assemble_outputs` (all-gather), `assemble_reduce_sum` (all-reduce) и `TPAggregatedState::get_state/set_state` теперь ходят через `m_transport`; форма полного состояния выводится из runtime-slice ранга (`full_shape=slice_shape; full_shape[axis]*=num_ranks`) — поддержка динамических batch/seq. **Конкурентность**: `m_infer_mutex` сериализует `infer()` одного запроса; `m_output_mutex` защищает lazy-аллокацию выходных буферов; независимые запросы изолированы (свои rank sub-запросы+transport+outputs). **Устройство**: device-side события (`zeEventPool`) и true in-graph inter-node коллективы НЕ реализованы (S12-приоритет — корректность/паритет); counter-based event+`zeEventHostSignal`=UNSUPPORTED, classic `zeEventCreate`=краш драйвера (S02) → staging. **Тесты S12** (`tensor_parallel.cpp`): билдер `make_dynamic_stateful_head_model(heads,head_dim)` (Variable `[?,heads,hd]`), `DynamicStateHeadShardingMatchesSingleGpu` (dynamic batch, seam `HEAD_SHARDED:1:4:`, multi-step паритет + агрегированное `[2,4,2]`), `DynamicStateIndivisibleStaysReplicated` (heads=3 → `REPLICATED:`), `StateRoundtripHeadShardedMatchesSingleGpu`, `StateRoundtripReplicatedMatchesSingleGpu`, `ConcurrentRequestsMatchSingleGpu` (2 sync + 2 async запроса). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); S04–S11 не затронуты (TP-off == upstream, форматы seams/state не менялись: `KIND:COLLECTIVE:TYPE:NAME`, `COLLECTIVE:...`, `KIND:AXIS:FULL_DIM:VARIABLE_ID`) |
 
+| 2026-10-18 | S13 Stage4.1 GenAI интеграция | **частично** (обвязка+тесты+док; прогон недоступен) | **Probe/путь свойства**: GenAI (openvino.genai, CB-бенчмарк — в этом дереве отсутствует, S01) передаёт строковый `ov::AnyMap {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` в `core.compile_model(model,"GPU",config)`; `ov::PluginConfig::set_user_property` конвертирует строку в `std::set<ov::hint::ModelDistributionPolicy>` (`ov::Any::as`, `any.hpp:767-784`; set Readable, enum Istreamable), GPU рекламирует свойство RW (`plugin.cpp:893`) → `compile_model_tensor_parallel` (`plugin.cpp:285`). **Расхождения property/config нет — правок плагина не требуется.** Разбор — `docs/notes/genai-integration.md` (§2 путь, §3 совместимость compile-фрейма, §4 ограничение реального Qwen, §5 тест-план) + `gpu-plugin-arch.md` §7. **Совместимость compile-фрейма**: name-based `set_tensor/get_tensor` (через `getPort` над `get_inputs()/get_outputs()`), `query_state()/set_state()` (`TPAggregatedState`) — покрывают GenAI-потребление stateful-модели. **Тесты S13** (`tensor_parallel.cpp`): `GenAiStringConfigEnablesTensorParallel` (строковый GenAI-конфиг → tp_ranks {0,1}, RO-property `model_distribution_policy`, seams непусты), `GenAiStyleStatefulRoundtripMatchesSingleGpu` (билдер `make_genai_style_stateful_model` с named IO `input_ids`/`logits` и динамическим seq; HEAD_SHARDED state, 4 шага + roundtrip `query_state/set_state`, паритет vs 1-GPU). **Реальный Qwen3.5-9B-int4 на TP2 остаётся преимущественно REPLICATED** (S07–S12) → генерация численно паритетна 1-GPU; спид-ап — S14+ (in-graph коллективы — S15). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, GenAI/2 GPU недоступны (см. «Блокеры») |
+
 ## Блокеры / открытые вопросы
+- **S13 GATE частичный (2026-10-18).** GenAI-путь разобран статически (код + контракт Core/плагина),
+  обвязка и эмуляционные тесты написаны, но **сборка OpenVINO недоступна** (сабмодули пусты),
+  **OpenVINO GenAI (openvino.genai) в дереве отсутствует**, а **2× Arc A770 на сборочной машине нет**
+  → паритет greedy-генерации Qwen3.5-9B-int4 TP2 vs 1-GPU не подтверждён. Тест-план и ручной
+  сценарий — `docs/notes/genai-integration.md` §5. Прогон `tensor_parallel` (в т.ч. новых
+  `GenAiStringConfigEnablesTensorParallel`, `GenAiStyleStatefulRoundtripMatchesSingleGpu`) — вне сессии.
 - **Сборка OpenVINO невозможна в этой среде (2026-10-17, S04).** Тулчейн на месте:
   MSVC `cl` 14.44 (VS 2022 Community), `cmake` 4.0.3, `ninja` — но все git-сабмодули
   не инициализированы (пустые каталоги). `cmake -G Ninja -S . -B build_tp ...` падает на
@@ -71,6 +79,30 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S13 done (частично, 2026-10-18)** — Stage 4.1 GenAI-интеграция. Артефакты/решения:
+  - **Probe (путь свойства)**: GenAI-путь = строковый `AnyMap` → `core.compile_model(model,"GPU",cfg)`.
+    Полный разбор — `docs/notes/genai-integration.md` (новый). Итог: строковый конфиг
+    `{"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` конвертируется в `std::set<ModelDistributionPolicy>`
+    в `ov::PluginConfig::set_user_property` через `ov::Any::as` (`any.hpp:767-784`; `Read<std::set<>>`,
+    enum `Istreamable`), доходит до `Plugin::compile_model` (`plugin.cpp:275-286`) → TP-ветка. **Правок
+    плагина/GenAI не потребовалось** (расхождения property vs config нет). GPU рекламирует свойство RW.
+  - **Совместимость compile-фрейма**: GenAI (LLMPipeline) использует публичный `ov::InferRequest`;
+    TP-обёртка поддерживает name-based `set_tensor/get_tensor` (через `getPort` над портами TP-модели),
+    `query_state()/set_state()` (KV/linear-attn через `TPAggregatedState`), `inputs()/outputs()`
+    (синтетические full-shape порты ALL_GATHER сохраняют friendly name). Корректность подтверждена
+    контрактом + новыми тестами (прогон вне сессии).
+  - **GenAI CB** (openvino.genai) в дереве отсутствует → «как в продакшене» проверяется эмуляцией
+    строкового конфига + name-based IO в тестах. Паритет реальной greedy-генерации Qwen3.5-9B-int4
+    TP2 vs 1-GPU НЕ прогонялся (нет сборки, GenAI-пакета и 2 GPU) → **частичный GATE**.
+  - **Тесты S13** (`tensor_parallel.cpp`): `GenAiStringConfigEnablesTensorParallel`;
+    `GenAiStyleStatefulRoundtripMatchesSingleGpu` + билдер `make_genai_style_stateful_model`.
+    Форматы `tp_seams`/`tp_output_seams`/`tp_state_seams` не менялись.
+  - **Ожидание по реальному Qwen**: TP2 остаётся преимущественно REPLICATED → выходы/состояние
+    ранга-0 → детерминированная генерация должна совпасть с 1-GPU. Полный спид-ап требует in-graph
+    межранговых коллективов (S15) и scheduler (S14).
+  - **S14 стартует с**: Stage 4.2 — Scheduler + бенч TP2 vs TP1/MULTI (GATE TPOT ≥ 1.5× на 2×BMG).
+    Точки: `TPInferRequest::infer()` сейчас serial (ранги последовательно, `m_infer_mutex`) —
+    scheduler/конкурентное исполнение рангов; бенч-инфра под CB; перф-репорт. См. NEXT.md.
 - **S12 done (частично, 2026-10-18)** — Stage 3.3 Hard: динамические state-шейпы + межранговый транспорт + конкурентность.
   Артефакты/решения:
   - **Динамика**: `TPStateSeam.full_shape` = `ov::PartialShape`. `find_state_head_axis(PartialShape)` требует
@@ -98,7 +130,7 @@
     `StateRoundtripReplicatedMatchesSingleGpu`, `ConcurrentRequestsMatchSingleGpu`. Форматы свойств стабильны.
   - **Сборка по-прежнему недоступна** (сабмодули пусты) → GATE частичный (код + план теста). Перед S13:
     при появлении сабмодулей — прогон `tensor_parallel` и Qwen3.5-9B-int4 TP2 vs 1-GPU (seq ~256).
-  - **S13 стартует с**: Stage 4.1 — GenAI интеграция (см. NEXT.md). Точки: `TPCompiledModel` уже отдаёт
+  - **S13 стартует с** (выполнено в S13, см. блок S13 выше): Stage 4.1 — GenAI интеграция (см. NEXT.md). Точки: `TPCompiledModel` уже отдаёт
     сериализуемые plan/seams и работает через штатный `ov::InferRequest` API (GenAI/OV-genai использует его напрямую);
     проверить `model_distribution_policy{TENSOR_PARALLEL}` со стороны GenAI-пайплайна, конфиг `tp` в `LLMPipeline`,
     поведение stateful-модели и `query_state/set_state` через GenAI.

@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05/S07/S08/S09/S10/S11/S12] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08/S09/S10/S11/S12/S13] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -33,7 +33,11 @@
 //      exposes the runtime full shape. Inter-rank collectives are routed through the host-USM
 //      staging transport, and state query/set round-trips + concurrent (sync/async) requests match
 //      single-GPU inference.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S12).
+// S13: GenAI integration - the OpenVINO GenAI continuous-batching path forwards tensor parallelism
+//      as a *string* config entry {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}; a stateful model
+//      compiled through that config and driven via the public name-based tensor API (as LLMPipeline
+//      does) must reach the TP branch and round-trip its head-sharded state.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S13).
 
 #include <algorithm>
 #include <cmath>
@@ -41,6 +45,7 @@
 #include <numeric>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "common_test_utils/ov_tensor_utils.hpp"
@@ -336,6 +341,35 @@ std::shared_ptr<ov::Model> make_dynamic_stateful_head_model(size_t heads, size_t
                                        ov::SinkVector{assign},
                                        ov::ParameterVector{x},
                                        "tp_dyn_state_head");
+}
+
+// [S13] GenAI-style stateful block with named IO and a dynamic sequence axis. This mirrors how
+// OpenVINO GenAI's LLMPipeline / continuous-batching pipeline drives a stateful decoder: it binds
+// tensors by *name* (set_tensor("input_ids", ...)/get_tensor("logits")) and manipulates state
+// through query_state()/set_state(). The ReadValue -> Add(broadcast) -> Assign chain is head-local
+// with a static divisible head axis, so it must be HEAD_SHARDED (aggregated at the GenAI boundary).
+std::shared_ptr<ov::Model> make_genai_style_stateful_model(size_t heads, size_t head_dim) {
+    auto variable = std::make_shared<ov::op::util::Variable>(
+        ov::op::util::VariableInfo{ov::PartialShape{ov::Dimension::dynamic(),
+                                                    static_cast<int64_t>(heads),
+                                                    static_cast<int64_t>(head_dim)},
+                                   ov::element::f32,
+                                   "past_key_values.0"});
+    auto read_value = std::make_shared<ov::op::v6::ReadValue>(variable);
+    auto x = std::make_shared<ov::op::v0::Parameter>(
+        ov::element::f32,
+        ov::PartialShape{ov::Dimension::dynamic(), 1, static_cast<int64_t>(head_dim)});
+    x->set_friendly_name("input_ids");
+    x->get_output_tensor(0).add_names({"input_ids"});
+    auto add = std::make_shared<ov::op::v1::Add>(read_value, x);
+    auto assign = std::make_shared<ov::op::v6::Assign>(add, variable);
+    auto result = std::make_shared<ov::op::v0::Result>(add);
+    result->set_friendly_name("logits");
+    result->get_output_tensor(0).add_names({"logits"});
+    return std::make_shared<ov::Model>(ov::ResultVector{result},
+                                       ov::SinkVector{assign},
+                                       ov::ParameterVector{x},
+                                       "tp_genai_stateful");
 }
 
 // Flattens a tensor to fp32 for numeric comparison (handles the GPU default f16 outputs).
@@ -1416,6 +1450,106 @@ TEST_F(TensorParallelCompileGPU, ConcurrentRequestsMatchSingleGpu) {
         ov::test::utils::compare(ref_outputs[0], r0.get_output_tensor(), 1e-3f, 1e-3f);
         ov::test::utils::compare(ref_outputs[1], r1.get_output_tensor(), 1e-3f, 1e-3f);
     }
+}
+
+// [S13] GenAI probe: the OpenVINO GenAI continuous-batching path forwards tensor parallelism as a
+// *string* config entry, e.g. {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"} (PLAN.md §3). This
+// test emulates exactly that GenAI-style config to prove the property is parsed by the GPU plugin
+// (string -> std::set<ModelDistributionPolicy> via ov::Any::as) and reaches the TP compile branch.
+TEST_F(TensorParallelCompileGPU, GenAiStringConfigEnablesTensorParallel) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    std::shared_ptr<ov::Model> shared_model = model;
+    // Same shape GenAI uses: a plain string value under the property's config key.
+    ov::AnyMap genai_config = {{"MODEL_DISTRIBUTION_POLICY", "TENSOR_PARALLEL"}};
+
+    ov::CompiledModel compiled_model;
+    OV_ASSERT_NO_THROW(compiled_model = core.compile_model(shared_model, ov::test::utils::DEVICE_GPU, genai_config));
+
+    auto ranks = compiled_model.get_property(ov::intel_gpu::tp_ranks).as<std::vector<int32_t>>();
+    EXPECT_EQ(ranks, (std::vector<int32_t>{0, 1})) << "GenAI string config did not enable tensor parallel";
+
+    // The string is surfaced as the typed enum set (read-only report).
+    auto policy = compiled_model.get_property(ov::hint::model_distribution_policy)
+                      .as<std::set<ov::hint::ModelDistributionPolicy>>();
+    EXPECT_EQ(policy.count(ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL), 1u);
+
+    // The shard-detection pass must have run on this GenAI-style compile.
+    auto seams = compiled_model.get_property(ov::intel_gpu::tp_seams).as<std::vector<std::string>>();
+    EXPECT_FALSE(seams.empty());
+}
+
+// [S13] GenAI-style stateful decode: compile through the GenAI string config, drive the model via
+// the public *name-based* tensor API (set_tensor("input_ids")/get_tensor("logits")) like
+// LLMPipeline does, run several dynamic-shape decode steps and compare against a single-GPU
+// reference. Verifies the TP compile frame is compatible with how GenAI consumes a stateful model
+// and that query_state()/set_state() round-trips the head-sharded KV state in that context.
+TEST_F(TensorParallelCompileGPU, GenAiStyleStatefulRoundtripMatchesSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    const size_t heads = 4;
+    const size_t head_dim = 2;
+    auto ref_model = make_genai_style_stateful_model(heads, head_dim);
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    ov::AnyMap genai_config = {{"MODEL_DISTRIBUTION_POLICY", "TENSOR_PARALLEL"}};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU, genai_config);
+
+    // The named state variable must be head-sharded (aggregated at the GenAI boundary).
+    auto state_seams = tp_compiled.get_property(ov::intel_gpu::tp_state_seams).as<std::vector<std::string>>();
+    ASSERT_EQ(state_seams.size(), 1u);
+    EXPECT_EQ(state_seams[0].rfind("HEAD_SHARDED:", 0), 0u) << "Unexpected state seam: " << state_seams[0];
+
+    auto ref_request = ref_compiled.create_infer_request();
+    auto tp_request = tp_compiled.create_infer_request();
+
+    // A GenAI-style prefill+decode loop on a dynamic sequence axis.
+    for (size_t t = 0; t < 4; ++t) {
+        const size_t step = t + 1;
+        ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+        auto* data = x.data<float>();
+        for (size_t i = 0; i < head_dim; ++i) {
+            data[i] = 0.2f * static_cast<float>(step) + static_cast<float>(i) - 0.4f;
+        }
+        // Name-based binding, exactly as GenAI/LLMPipeline drives a stateful decoder.
+        ref_request.set_tensor("input_ids", x);
+        tp_request.set_tensor("input_ids", x);
+        ref_request.infer();
+        tp_request.infer();
+        const ov::Tensor ref_output = ref_request.get_tensor("logits");
+        const ov::Tensor tp_output = tp_request.get_tensor("logits");
+        ASSERT_EQ(ref_output.get_shape(), tp_output.get_shape());
+        ov::test::utils::compare(ref_output, tp_output, 1e-4f, 1e-4f);
+    }
+
+    // GenAI round-trips the KV cache through query_state()/set_state() between steps.
+    auto ref_states = ref_request.query_state();
+    auto tp_states = tp_request.query_state();
+    ASSERT_EQ(tp_states.size(), 1u);
+    ASSERT_EQ(ref_states.size(), 1u);
+    const ov::Tensor captured = tp_states[0].get_state();
+    ASSERT_EQ(captured.get_shape(), (ov::Shape{1, heads, head_dim}));
+    ov::test::utils::compare(ref_states[0].get_state(), captured, 1e-4f, 1e-4f);
+    tp_states[0].set_state(captured);
+
+    // One more step after the round-trip must still match the single-GPU reference.
+    ov::Tensor x(ov::element::f32, ov::Shape{1, 1, head_dim});
+    auto* data = x.data<float>();
+    for (size_t i = 0; i < head_dim; ++i) {
+        data[i] = -0.3f + static_cast<float>(i);
+    }
+    ref_request.set_tensor("input_ids", x);
+    tp_request.set_tensor("input_ids", x);
+    ref_request.infer();
+    tp_request.infer();
+    ov::test::utils::compare(ref_request.get_tensor("logits"), tp_request.get_tensor("logits"), 1e-4f, 1e-4f);
 }
 
 }  // namespace

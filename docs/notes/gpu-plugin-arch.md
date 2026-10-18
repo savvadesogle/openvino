@@ -19,6 +19,9 @@
 - Заметка: `tools/continuous_batching` в ЭТОМ репо отсутствует (это репозиторий
   openvino.genai). В здешнем дереве строка `MODEL_DISTRIBUTION_POLICY` есть
   только в properties.hpp и pybind. Для S13 (GenAI-форк) смотреть отдельный репо.
+  Путь свойства GenAI → TP-ветка плагина разобран в `docs/notes/genai-integration.md` §2
+  (S13): строковый конфиг `{"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` конвертируется в
+  `std::set<ModelDistributionPolicy>` через `ov::Any::as` и доходит до `compile_model_tensor_parallel`.
 
 ## 2. «1 CompiledModel = 1 device»
 
@@ -117,3 +120,19 @@
 5. Blob-cache (`plugin/compiled_model.cpp:77-140`): compat-descriptor проверяет
    runtime requirements; per-rank кэш надо различать по (rank, device) —
    учитывать в S16 (по PLAN), не сейчас.
+
+## 7. GenAI-интеграция (S13)
+
+- Полный разбор пути свойства `MODEL_DISTRIBUTION_POLICY=TENSOR_PARALLEL` от OpenVINO GenAI
+  (LLMPipeline / continuous-batching) до TP-ветки `Plugin::compile_model`, анализ
+  property-vs-config и совместимость compile-фрейма — в `docs/notes/genai-integration.md`.
+- Кратко: GenAI передаёт строковый `ov::AnyMap` `{"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` в
+  `core.compile_model(model,"GPU",config)`; `ov::PluginConfig::set_user_property` конвертирует строку
+  в `std::set<ov::hint::ModelDistributionPolicy>` (`ov::Any::as`, `any.hpp:767-784`), GPU-плагин
+  рекламирует свойство RW (`plugin.cpp:893`) и уходит в `compile_model_tensor_parallel`
+  (`plugin.cpp:285`). Правок GenAI/плагина не требуется.
+- TP-обёртка совместима с GenAI-потреблением stateful-модели: name-based `set_tensor/get_tensor`,
+  `query_state()/set_state()` (KV/linear-attn). Эмуляционные тесты — `TensorParallelCompileGPU.
+  GenAiStringConfigEnablesTensorParallel`, `GenAiStyleStatefulRoundtripMatchesSingleGpu`.
+- Реальный Qwen3.5-9B-int4 на TP2 остаётся преимущественно REPLICATED (S07–S12) → генерация
+  должна быть численно паритетна 1-GPU; in-graph межранговые коллективы — вне S13.
