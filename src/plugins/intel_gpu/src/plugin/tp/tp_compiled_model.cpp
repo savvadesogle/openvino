@@ -35,6 +35,14 @@ TPCompiledModel::TPCompiledModel(const std::shared_ptr<const ov::IPlugin>& plugi
     set_task_executor(std::make_shared<ov::threading::CPUStreamsExecutor>(
         ov::threading::IStreamsExecutor::Config{"Intel GPU TP plugin executor"}));
 
+    // [S14] Rank scheduler: one stream per rank. TPInferRequest dispatches the k per-rank
+    // sub-requests here (ITaskExecutor::run_and_wait) so they execute concurrently on their
+    // own devices instead of serially. Kept at compiled-model scope: a pool, not per-infer
+    // threads, because decode calls infer() once per token.
+    m_rank_executor = std::make_shared<ov::threading::CPUStreamsExecutor>(
+        ov::threading::IStreamsExecutor::Config{"Intel GPU TP rank scheduler",
+                                                static_cast<int>(m_ranks.size())});
+
     build_output_ports();
 }
 

@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05/S07/S08/S10/S12] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S07/S08/S10/S12/S14] Experimental GPU tensor-parallel support.
 // TPInferRequest drives k per-rank inference requests (one per device): inputs are replicated
 // to every rank, only rank-0 outputs are exposed. S07 assembles N-split outputs (all-gather
 // equivalent, concatenation); S08 sums K-split outputs (all-reduce sum) with fp32 accumulation
@@ -10,6 +10,9 @@
 // (and scattered on set_state()); replicated variables are rank-0 authoritative.
 // S12 routes the collectives through TPTransport (host-USM staging, G0), aggregates state by
 // runtime shape (dynamic batch/seq), and serializes inference per request for async/multi-request.
+// S14 schedules the k rank sub-requests in parallel on the compiled model's k-stream rank
+// executor (one rank per stream/device); inputs are replicated before the fan-out and outputs
+// are assembled after every rank has completed, so determinism is preserved.
 // See PLAN.md §4.3, §4.4, §7.4.
 
 #pragma once
@@ -22,6 +25,12 @@
 #include "intel_gpu/plugin/tp/tp_plan.hpp"
 #include "openvino/runtime/isync_infer_request.hpp"
 #include "openvino/runtime/so_ptr.hpp"
+
+namespace ov {
+namespace threading {
+class IStreamsExecutor;
+}  // namespace threading
+}  // namespace ov
 
 namespace ov::intel_gpu {
 
@@ -63,6 +72,11 @@ private:
     // Ensures every rank sees the same input data as rank 0 before execution.
     void replicate_inputs();
 
+    // [S14] Runs the k per-rank sub-requests concurrently on the shared k-stream rank scheduler
+    // (one rank per stream/device) and returns once every rank has completed. Falls back to the
+    // serial loop when no scheduler executor is available (defensive; single-rank / misconfigured).
+    void schedule_ranks();
+
     // [S07/S08] Assembles the full model outputs on rank 0: N-split outputs are all-gathered
     // (concatenation, no arithmetic), K-split outputs are all-reduced (fp32 sum) and replicated
     // bias/residual terms are added once. Replicated outputs are copied over from rank 0 verbatim.
@@ -84,6 +98,9 @@ private:
                                           const ov::element::Type& element_type) const;
 
     std::vector<ov::SoPtr<ov::ISyncInferRequest>> m_rank_requests;
+    // [S14] Shared k-stream rank scheduler (owned by the compiled model). Dispatches the per-rank
+    // sub-requests so they run in parallel; not owned here.
+    std::shared_ptr<ov::threading::IStreamsExecutor> m_rank_executor;
     // [S12] Inter-rank collective transport (host-USM staging). Owns the reusable staging buffer
     // and is shared with the state aggregators returned by query_state().
     std::shared_ptr<TPTransport> m_transport;

@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S04/S05/S07/S08/S09/S10/S11/S12/S13] GATE tests for the GPU tensor-parallel compile + infer path.
+// [TP-GPU, S04/S05/S07/S08/S09/S10/S11/S12/S13/S14] GATE tests for the GPU tensor-parallel compile + infer path.
 // S04: Plugin::compile_model with model_distribution_policy{TENSOR_PARALLEL} over a 2-GPU
 //      mini network (Parameter -> MatMul -> Result) must succeed and report k=2 ranks via
 //      ov::intel_gpu::tp_ranks.
@@ -37,7 +37,10 @@
 //      as a *string* config entry {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}; a stateful model
 //      compiled through that config and driven via the public name-based tensor API (as LLMPipeline
 //      does) must reach the TP branch and round-trip its head-sharded state.
-// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S13).
+// S14: rank scheduler - the k rank sub-requests are dispatched in parallel on a shared k-stream
+//      executor (one rank per device); several overlapping async requests plus a repeated
+//      synchronous infer must still match single-GPU inference deterministically.
+// See PLAN.md §4.1, §4.2, §4.3, §4.4, §5, §7.4 (S04-S14).
 
 #include <algorithm>
 #include <cmath>
@@ -1449,6 +1452,79 @@ TEST_F(TensorParallelCompileGPU, ConcurrentRequestsMatchSingleGpu) {
         r1.wait();
         ov::test::utils::compare(ref_outputs[0], r0.get_output_tensor(), 1e-3f, 1e-3f);
         ov::test::utils::compare(ref_outputs[1], r1.get_output_tensor(), 1e-3f, 1e-3f);
+    }
+}
+
+// [S14] Scheduler: the k rank sub-requests must execute in parallel on the compiled model's
+// k-stream rank scheduler while the assembled outputs stay deterministic. This test fires several
+// overlapping asynchronous requests (more than the number of ranks) on an N-split (all-gather)
+// model and checks every result against its single-GPU reference; then it re-runs a single request
+// twice and requires a bit-identical output, proving the parallel fan-out does not race the shared
+// input-replication / staging paths.
+TEST_F(TensorParallelCompileGPU, SchedulerParallelRanksMatchSingleGpu) {
+    ov::Core core;
+    if (count_gpu_devices(core) < 2) {
+        GTEST_SKIP() << "Tensor parallel requires at least 2 GPUs";
+    }
+
+    auto ref_model = make_mlp_nsplit_model();
+    auto tp_model = ref_model->clone();
+
+    auto ref_compiled = core.compile_model(ref_model, ov::test::utils::DEVICE_GPU);
+    std::set<ov::hint::ModelDistributionPolicy> tp_policy = {ov::hint::ModelDistributionPolicy::TENSOR_PARALLEL};
+    auto tp_compiled = core.compile_model(tp_model, ov::test::utils::DEVICE_GPU,
+                                          {ov::hint::model_distribution_policy(tp_policy)});
+
+    const size_t num_requests = 4;  // 2x the number of ranks: forces rank-stream reuse.
+    std::vector<ov::Tensor> inputs;
+    std::vector<ov::Tensor> ref_outputs;
+    inputs.reserve(num_requests);
+    ref_outputs.reserve(num_requests);
+    for (size_t n = 0; n < num_requests; ++n) {
+        ov::Tensor input(ov::element::f32, ov::Shape{1, 8});
+        auto* data = input.data<float>();
+        for (size_t i = 0; i < 8; ++i) {
+            data[i] = 0.13f * static_cast<float>(i + 1) * static_cast<float>(n + 1) - 0.7f;
+        }
+        auto ref_request = ref_compiled.create_infer_request();
+        ref_request.set_input_tensor(input);
+        ref_request.infer();
+        inputs.push_back(input);
+        ref_outputs.push_back(ref_request.get_output_tensor());
+    }
+
+    // All requests start before any is waited on: the rank scheduler is exercised concurrently.
+    std::vector<ov::InferRequest> tp_requests;
+    tp_requests.reserve(num_requests);
+    for (size_t n = 0; n < num_requests; ++n) {
+        auto request = tp_compiled.create_infer_request();
+        request.set_input_tensor(inputs[n]);
+        request.start_async();
+        tp_requests.push_back(request);
+    }
+    for (size_t n = 0; n < num_requests; ++n) {
+        tp_requests[n].wait();
+        ov::test::utils::compare(ref_outputs[n], tp_requests[n].get_output_tensor(), 1e-3f, 1e-3f);
+    }
+
+    // Determinism under a repeated (synchronous) infer on one request.
+    auto stable_request = tp_compiled.create_infer_request();
+    stable_request.set_input_tensor(inputs[0]);
+    stable_request.infer();
+    const ov::Tensor first = stable_request.get_output_tensor();
+    std::vector<float> first_values(first.get_size());
+    ov::test::utils::compare(ref_outputs[0], first, 1e-3f, 1e-3f);
+    {
+        const auto count = first.get_size();
+        for (size_t i = 0; i < count; ++i) {
+            first_values[i] = first.data<float>()[i];
+        }
+    }
+    stable_request.infer();
+    const ov::Tensor second = stable_request.get_output_tensor();
+    ASSERT_EQ(first.get_shape(), second.get_shape());
+    for (size_t i = 0; i < first_values.size(); ++i) {
+        EXPECT_EQ(first_values[i], second.data<float>()[i]) << "Non-deterministic output at " << i;
     }
 }
 

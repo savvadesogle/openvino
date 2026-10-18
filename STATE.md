@@ -27,7 +27,7 @@
 - [x] S11 Stage3.2 linear_attention (2026-10-17; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S12 Stage3.3 Hard (2026-10-18; код+тест готовы, GATE частичный — сборка недоступна)
 - [x] S13 Stage4.1 GenAI интеграция (2026-10-18; обвязка+тесты+док, GATE частичный — сборка/GenAI/2 GPU недоступны)
-- [ ] S14 Stage4.2 Scheduler + бенч
+- [x] S14 Stage4.2 Scheduler + бенч (2026-10-18; scheduler+тесты+бенч-харнесс+бенч-план, GATE частичный — сборка/2 GPU недоступны)
 - [ ] S15 Stage5.1 перф
 - [ ] S16 Stage5.2 стабилизация
 
@@ -53,9 +53,17 @@
 
 | 2026-10-18 | S12 Stage3.3 Hard (dynamic/transport/concurrency) | **частично** (код+тест готовы) | **Динамические state-шейпы**: `TPStateSeam.full_shape` переведён `ov::Shape`→`ov::PartialShape` (`tp_plan.hpp`); `TPShardTransform::find_state_head_axis` принимает `PartialShape` и требует, чтобы head-ось была **статической и делимой** (`axis.is_static() && get_length()%num_ranks==0`), а `analyze_state_variable` пропускает динамический ранг/динамические внутренние оси (`rank().is_dynamic()` — REPLICATED без throw), вместо прежнего отклонения «dynamic state shape». Шардинг: `sharded[axis]=ov::Dimension(full_dim/num_ranks)` при сохранении динамики batch/seq, затем `update_data_shape(sharded)`+`validate_nodes_and_infer_types()`. Это снимает барьер для всех реальных Qwen-состояний `?,4,?,256`/`?,8192,4`/`?,32,128,128` (но сами они по-прежнему REPLICATED — потребители не head-local, см. S10/S11). **Межранговый транспорт**: новый `TPTransport` (`tp_transport.hpp/.cpp`) — host-USM staging (G0): reusable pinned-host staging-буфер, коллективы `all_gather_axis`/`scatter_axis`/`all_reduce_sum_fp32` (fp32-аккумуляция + «term один раз»), capabilities-probe фиксирует `HOST_STAGING`/peer=false/ipc=false (S02/S03), PEER — только runtime fast-path hook (S15). Перенесённые хелперы (`copy_axis_region`/`extract_axis_region`/`tensor_to_floats`/`floats_to_tensor`/`row_major_strides`/`accumulate_scaled_broadcast`) вынесены из `tp_infer_request.cpp` в транспорт. `assemble_outputs` (all-gather), `assemble_reduce_sum` (all-reduce) и `TPAggregatedState::get_state/set_state` теперь ходят через `m_transport`; форма полного состояния выводится из runtime-slice ранга (`full_shape=slice_shape; full_shape[axis]*=num_ranks`) — поддержка динамических batch/seq. **Конкурентность**: `m_infer_mutex` сериализует `infer()` одного запроса; `m_output_mutex` защищает lazy-аллокацию выходных буферов; независимые запросы изолированы (свои rank sub-запросы+transport+outputs). **Устройство**: device-side события (`zeEventPool`) и true in-graph inter-node коллективы НЕ реализованы (S12-приоритет — корректность/паритет); counter-based event+`zeEventHostSignal`=UNSUPPORTED, classic `zeEventCreate`=краш драйвера (S02) → staging. **Тесты S12** (`tensor_parallel.cpp`): билдер `make_dynamic_stateful_head_model(heads,head_dim)` (Variable `[?,heads,hd]`), `DynamicStateHeadShardingMatchesSingleGpu` (dynamic batch, seam `HEAD_SHARDED:1:4:`, multi-step паритет + агрегированное `[2,4,2]`), `DynamicStateIndivisibleStaysReplicated` (heads=3 → `REPLICATED:`), `StateRoundtripHeadShardedMatchesSingleGpu`, `StateRoundtripReplicatedMatchesSingleGpu`, `ConcurrentRequestsMatchSingleGpu` (2 sync + 2 async запроса). **GATE по сборке/прогону не подтверждён** — сабмодули пусты (см. «Блокеры»); S04–S11 не затронуты (TP-off == upstream, форматы seams/state не менялись: `KIND:COLLECTIVE:TYPE:NAME`, `COLLECTIVE:...`, `KIND:AXIS:FULL_DIM:VARIABLE_ID`) |
 
+| 2026-10-18 | S14 Stage4.2 Scheduler + бенч | **частично** (scheduler+тесты+бенч-план; перф-прогон недоступен) | **Rank scheduler (ядро)**: новый `TPInferRequest::schedule_ranks()` (`tp_infer_request.cpp`) исполняет k per-rank sub-запросов **параллельно** на общем k-stream `ov::threading::IStreamsExecutor` (подход **(б)**), созданном в `TPCompiledModel` (`m_rank_executor`, один stream на ранг/устройство). Диспетчер — `ITaskExecutor::run_and_wait(tasks)` (тот же приём, что у `ov::IAsyncInferRequest`, `iasync_infer_request.cpp:29`): пул переживает запрос (нет потоков на инференс — важно для decode), исключения рангов агрегируются через packaged_task/future. Порядок: `replicate_inputs()` (до fan-out) → `schedule_ranks()` (ждём ВСЕ ранги) → `assemble_outputs()` (одним потоком, детерминированно). `m_infer_mutex` сохранён (не-реентерабельность одного запроса); независимые запросы изолированы. Fallback на serial-цикл при отсутствии executor/1 ранге. **Тест** `SchedulerParallelRanksMatchSingleGpu` (4 перекрывающихся async-запроса на N-split/all-gather модели + повторный sync-infer → бит-идентичный выход = нет гонок staging). **Бенч-обвязка**: `tools/tp_bench/tp_bench.py` (TTFT/TPOT TP1/TP2/MULTI через публичный API; GenAI-LLMPipeline при наличии, иначе indicative decode-step proxy) + `tools/tp_bench/README.md` + бенч-план `docs/notes/tp-bench-plan.md` (метрики/среда/команды/критерии/профиль узких мест). **GATE по перфу не подтверждён** — сборки/2 GPU/GenAI нет (см. «Блокеры»); ожидаемый вклад: host-USM staging G0 (~4–5 GB/s) + преимущественно REPLICATED Qwen → TPOT_ratio≈1.0 до S15 |
 | 2026-10-18 | S13 Stage4.1 GenAI интеграция | **частично** (обвязка+тесты+док; прогон недоступен) | **Probe/путь свойства**: GenAI (openvino.genai, CB-бенчмарк — в этом дереве отсутствует, S01) передаёт строковый `ov::AnyMap {"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}` в `core.compile_model(model,"GPU",config)`; `ov::PluginConfig::set_user_property` конвертирует строку в `std::set<ov::hint::ModelDistributionPolicy>` (`ov::Any::as`, `any.hpp:767-784`; set Readable, enum Istreamable), GPU рекламирует свойство RW (`plugin.cpp:893`) → `compile_model_tensor_parallel` (`plugin.cpp:285`). **Расхождения property/config нет — правок плагина не требуется.** Разбор — `docs/notes/genai-integration.md` (§2 путь, §3 совместимость compile-фрейма, §4 ограничение реального Qwen, §5 тест-план) + `gpu-plugin-arch.md` §7. **Совместимость compile-фрейма**: name-based `set_tensor/get_tensor` (через `getPort` над `get_inputs()/get_outputs()`), `query_state()/set_state()` (`TPAggregatedState`) — покрывают GenAI-потребление stateful-модели. **Тесты S13** (`tensor_parallel.cpp`): `GenAiStringConfigEnablesTensorParallel` (строковый GenAI-конфиг → tp_ranks {0,1}, RO-property `model_distribution_policy`, seams непусты), `GenAiStyleStatefulRoundtripMatchesSingleGpu` (билдер `make_genai_style_stateful_model` с named IO `input_ids`/`logits` и динамическим seq; HEAD_SHARDED state, 4 шага + roundtrip `query_state/set_state`, паритет vs 1-GPU). **Реальный Qwen3.5-9B-int4 на TP2 остаётся преимущественно REPLICATED** (S07–S12) → генерация численно паритетна 1-GPU; спид-ап — S14+ (in-graph коллективы — S15). **GATE по сборке/прогону не подтверждён** — сабмодули пусты, GenAI/2 GPU недоступны (см. «Блокеры») |
 
 ## Блокеры / открытые вопросы
+- **S14 GATE частичный (2026-10-18).** Ранги теперь исполняются параллельно
+  (`schedule_ranks()` + общий k-stream executor), тесты и бенч-обвязка написаны, но
+  **сборка OpenVINO недоступна** (сабмодули пусты) и **2× GPU / OpenVINO GenAI на сборочной машине нет**
+  → перф-прогон (`tp_bench.py`) и главный GATE **TPOT ≥ 1.5× / TTFT ≥ 1.3× на 2× BMG** не подтверждён.
+  Ожидание: реальный Qwen остаётся преимущественно REPLICATED (S07–S13) → TPOT_ratio≈1.0;
+  ≥1.5× требует S15 (peer/ring, in-graph коллективы). Бенч-план/ручной сценарий —
+  `docs/notes/tp-bench-plan.md`; харнесс — `tools/tp_bench/tp_bench.py`. Прогон — вне сессии.
 - **S13 GATE частичный (2026-10-18).** GenAI-путь разобран статически (код + контракт Core/плагина),
   обвязка и эмуляционные тесты написаны, но **сборка OpenVINO недоступна** (сабмодули пусты),
   **OpenVINO GenAI (openvino.genai) в дереве отсутствует**, а **2× Arc A770 на сборочной машине нет**
@@ -79,6 +87,51 @@
 - Докачать `openvino_mtp_model.{xml,bin}` перед S10/S11 (не блокер).
 
 ## Заметки сессия → следующая
+- **S14 done (частично, 2026-10-18)** — Stage 4.2 Scheduler + бенч TP2 vs TP1/MULTI. Артефакты/решения:
+  - **Scheduler — подход (б)**: `TPInferRequest::schedule_ranks()` строит k задач `rank_r->infer()` и
+    вызывает `m_rank_executor->run_and_wait(tasks)`. `m_rank_executor` = `CPUStreamsExecutor`
+    с `streams = num_ranks` (имя "Intel GPU TP rank scheduler"), создаётся в `TPCompiledModel`
+    ctor и живёт вместе с compiled model. Обоснование выбора:
+    (а) `std::async`/per-infer пул — потоки на каждый infer (плохо для decode, infer на токен);
+    (б) общий `IStreamsExecutor` с k задачами — **выбран**: переиспользует OV-инфраструктуру
+    (`ITaskExecutor::run_and_wait`, как в `iasync_infer_request.cpp:29`), пул переживает запрос,
+    k stream'ов = k устройств, гарантированный параллелизм, корректный проброс исключений;
+    (в) async sub-запросы — rank-модели дают sync-запросы, их `infer()` блокирует, отдельный
+    async-путь не нужен. **Детерминизм**: fan-out только после `replicate_inputs()`; `assemble_outputs()`
+    (all-gather/all-reduce через `TPTransport`) и агрегация состояния — строго после `run_and_wait`,
+    в вызывающем потоке → порядок сборки не меняется. `m_infer_mutex` (per-request) и `m_output_mutex`
+    сохранены; fallback на serial-цикл при `nullptr`/1 ранге (defensive).
+  - **Точки касания**: `tp_infer_request.{hpp,cpp}` (`m_rank_executor`, `schedule_ranks()`),
+    `tp_compiled_model.{hpp,cpp}` (член+геттер `get_rank_executor()`, создание пула). Форматы
+    `tp_seams`/`tp_output_seams`/`tp_state_seams` не менялись. Публичный API/свойства не менялись.
+  - **Тесты S14** (`tensor_parallel.cpp`): `SchedulerParallelRanksMatchSingleGpu` — 4 перекрывающихся
+    async-запроса (2× рангов) на N-split (all-gather) модели, каждый сверяется с 1-GPU reference;
+    затем повторный `infer()` того же запроса даёт **бит-идентичный** выход (проверка отсутствия
+    гонок общего staging/replication). `SKIP <2 GPU`. Существующий `ConcurrentRequestsMatchSingleGpu`
+    (S12) не тронут (регресс-гарантия изоляции запросов).
+  - **Бенч-обвязка**: `tools/tp_bench/tp_bench.py` — Python-харнесс через публичный API,
+    варианты **TP1** (`compile_model(model,"GPU")`), **TP2**
+    (`{"MODEL_DISTRIBUTION_POLICY":"TENSOR_PARALLEL"}`), **MULTI** (`"MULTI:GPU,GPU"`); greedy
+    (`temperature=0`,`do_sample=False`,`num_beams=1`), фикс. warmup/iters/max_new_tokens; при наличии
+    `openvino_genai` берёт реальные TTFT/TPOT (per-token timestamps), иначе называется
+    indicative `decode_step_proxy`. GATE-отношения (`TPOT_T1/T2 ≥ 1.5`, `TTFT_T1/T2 ≥ 1.3`)
+    считаются только на настоящих метриках. `README.md` + бенч-план `docs/notes/tp-bench-plan.md`.
+  - **Ожидание по перфу (не измерено)**: реальный Qwen3.5-9B-int4 на TP2 преимущественно
+    **REPLICATED** (S07–S13) → оба GPU считают полный граф, scheduler лишь **перекрывает** их
+    (устраняет serial-регресс S05–S13 ≈2×). Spид-ап ограничен: TPOT_ratio ≈ 1.0 (не 1.5) плюс
+    минус host-USM staging G0 (события/копии ~4–5 GB/s, ~60–90 µs/вызов, S03) и отсутствие
+    in-graph коллективов. Достижение ≥1.5× требует S15 (peer-копии, ring/tree allreduce,
+    in-graph all-gather, снятие REPLICATED на реальных слоях). После S14 perf-регресс «TP2 = 2×
+    медленнее TP1» устранён; потолок REPLICATED — TPOT_ratio≈1.0.
+  - **Память (план)**: без дублирования весов для шардированных (N/K-SPLIT) узлов — срез до upload
+    (S07–S09, PLAN §4.2); REPLICATED-узлы реального Qwen дают 1× на ранг (k× суммарно) — известное
+    ограничение, не регресс. Проверка — индикативно по RSS/VRAM в `tp-bench-plan.md` §1/§5.
+  - **Сборка по-прежнему недоступна** (сабмодули пусты) → GATE частичный. Перед S15: при появлении
+    сабмодулей/2 GPU — собрать плагин, прогнать `tensor_parallel` (в т.ч. `SchedulerParallelRanksMatchSingleGpu`)
+    и `tp_bench.py` (TP1/TP2/MULTI) на 2×A770 / 2×BMG.
+  - **S15 стартует с**: Stage 5.1 — перф (peer-копии, ring/tree allreduce, in-graph device-side
+    коллективы, снятие REPLICATED на реальных слоях), prefill/decode отчёт, закрытие GATE TPOT≥1.5×.
+    См. NEXT.md.
 - **S13 done (частично, 2026-10-18)** — Stage 4.1 GenAI-интеграция. Артефакты/решения:
   - **Probe (путь свойства)**: GenAI-путь = строковый `AnyMap` → `core.compile_model(model,"GPU",cfg)`.
     Полный разбор — `docs/notes/genai-integration.md` (новый). Итог: строковый конфиг

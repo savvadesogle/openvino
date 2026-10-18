@@ -1,7 +1,7 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05/S07/S08/S10/S12] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S07/S08/S10/S12/S14] Experimental GPU tensor-parallel support.
 // TPInferRequest drives k per-rank inference requests (one per device).
 //  - S05: replicated graph, inputs replicated to every rank, rank-0 outputs;
 //  - S07: N-split ranks produce only their output-channel slice; rank-0 outputs marked as
@@ -13,6 +13,9 @@
 //  - S12: inter-rank collectives (all-gather/all-reduce) are routed through the TPTransport
 //    host-USM staging boundary; dynamic (partially-shaped) state variables are aggregated
 //    runtime-shape-driven; inference is serialized per request to support async/multi-request use.
+//  - S14: the k rank sub-requests are scheduled in parallel on the compiled model's k-stream rank
+//    executor (one rank per stream/device). Input replication happens before the fan-out and
+//    output/state assembly after every rank has finished, so the assembly order stays deterministic.
 // See PLAN.md §4.3, §4.4, §7.4.
 
 #include "intel_gpu/plugin/tp/tp_infer_request.hpp"
@@ -33,6 +36,7 @@
 #include "openvino/runtime/iremote_tensor.hpp"
 #include "openvino/runtime/ivariable_state.hpp"
 #include "openvino/runtime/make_tensor.hpp"
+#include "openvino/runtime/threading/istreams_executor.hpp"
 
 namespace {
 
@@ -167,6 +171,10 @@ TPInferRequest::TPInferRequest(const std::shared_ptr<const TPCompiledModel>& com
         OPENVINO_ASSERT(rank_model, "[GPU][TP] Encountered a null rank model");
         m_rank_requests.push_back(rank_model->create_sync_infer_request());
     }
+    // [S14] Rank scheduler: the shared k-stream executor owned by the compiled model. Each rank
+    // runs on its own stream/device; the pool outlives the request (no threads per inference).
+    m_rank_executor = compiled_model->get_rank_executor();
+
     // [S12] Inter-rank collectives run over the host-USM staging boundary (G0). One transport per
     // request owns the reusable staging buffer; it is shared with the state aggregators.
     m_transport = std::make_shared<TPTransport>(m_rank_requests.size());
@@ -178,20 +186,41 @@ void TPInferRequest::infer() {
 
     // [S12] Serialize inference on a single request. Separate requests are independent objects
     // (each owns its rank sub-requests, transport and outputs), so concurrent async requests are
-    // safe; a single request must not be re-entered concurrently. Parallel per-rank execution is
-    // deferred to the scheduler stage (S14).
+    // safe; a single request must not be re-entered concurrently.
     std::lock_guard<std::mutex> lock(m_infer_mutex);
 
     // Ranks receive replicated inputs: make sure each rank sees the same data as rank 0.
+    // Done before the fan-out so every rank starts from the same inputs.
     replicate_inputs();
 
-    // MVP: run ranks sequentially (deterministic ordering for the staging collectives).
-    for (auto& request : m_rank_requests) {
-        request->infer();
-    }
+    // [S14] Run the k per-rank sub-requests in parallel (one per device); returns once all ranks
+    // have completed. Collectives/assembly below run single-threaded afterwards (deterministic).
+    schedule_ranks();
 
     // Gather the per-rank N-slices into the full outputs on rank 0.
     assemble_outputs();
+}
+
+void TPInferRequest::schedule_ranks() {
+    // [S14] Dispatch one task per rank onto the shared k-stream executor and wait for all of them.
+    // The rank sub-requests block inside infer() until their device work is done, so with k
+    // streams the k tasks occupy k distinct worker threads and overlap across devices.
+    if (m_rank_executor && m_rank_executor->get_streams_num() >= 1 && m_rank_requests.size() > 1) {
+        std::vector<ov::threading::Task> tasks;
+        tasks.reserve(m_rank_requests.size());
+        for (auto& request : m_rank_requests) {
+            tasks.emplace_back([&request] {
+                request->infer();
+            });
+        }
+        m_rank_executor->run_and_wait(tasks);
+        return;
+    }
+
+    // Fallback (defensive): sequential execution preserving the deterministic rank order.
+    for (auto& request : m_rank_requests) {
+        request->infer();
+    }
 }
 
 void TPInferRequest::replicate_inputs() {

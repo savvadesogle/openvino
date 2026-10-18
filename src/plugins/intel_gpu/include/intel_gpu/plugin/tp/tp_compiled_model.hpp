@@ -1,10 +1,12 @@
 // Copyright (C) 2018-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
-// [TP-GPU, S05] Experimental GPU tensor-parallel support.
+// [TP-GPU, S05/S14] Experimental GPU tensor-parallel support.
 // TPCompiledModel wraps k per-rank CompiledModel instances (one per device) and a TPPlan.
 // It reports the tensor-parallel rank table (ov::intel_gpu::tp_ranks) and creates a
 // TPInferRequest that executes the replicated graph on all k ranks (rank-0 outputs).
+// S14 adds a dedicated k-stream rank scheduler executor so per-rank sub-requests run in
+// parallel (one stream per device) instead of serially.
 // Sharding and device-side seams are implemented in S06+.
 // See PLAN.md §4.4.
 
@@ -17,6 +19,12 @@
 #include "intel_gpu/plugin/compiled_model.hpp"
 #include "intel_gpu/plugin/tp/tp_plan.hpp"
 #include "openvino/runtime/icompiled_model.hpp"
+
+namespace ov {
+namespace threading {
+class IStreamsExecutor;
+}  // namespace threading
+}  // namespace ov
 
 namespace ov::intel_gpu {
 
@@ -52,12 +60,20 @@ public:
     const TPPlan& get_tp_plan() const { return m_plan; }
     const std::vector<std::shared_ptr<CompiledModel>>& get_rank_models() const { return m_ranks; }
 
+    // [S14] Shared rank scheduler: a k-stream executor (one stream per TP rank) used by
+    // TPInferRequest to run the per-rank sub-requests concurrently. Owned for the lifetime of
+    // the compiled model so no threads are created per inference (decode calls infer() per token).
+    const std::shared_ptr<ov::threading::IStreamsExecutor>& get_rank_executor() const { return m_rank_executor; }
+
 private:
     // Builds m_outputs: full-shape ports for N-split assembly outputs, native ports otherwise.
     void build_output_ports();
 
     std::vector<std::shared_ptr<CompiledModel>> m_ranks;
     TPPlan m_plan;
+
+    // [S14] One stream per rank; the k rank sub-requests are dispatched here via run_and_wait.
+    std::shared_ptr<ov::threading::IStreamsExecutor> m_rank_executor;
 
     // [S07] Model outputs as exposed to the user. Outputs produced by an N-split GEMM are
     // advertised at their FULL (unsharded) shape even though each rank only materializes its
