@@ -144,6 +144,14 @@ MoE, record&replay для TP, num_streams×ранги, oneCCL, OVMS plumbing, NP
 | S15 | Stage 5.1 перф: peer-копии, ring/tree allreduce | prefill/decode отчёт |
 | S16 | Stage 5.2 стабилизация: blob-cache per rank, docs, upstream-серии | матрица §6 зелень |
 
+> **Статус (2026-10-18).** S01–S16 выполнены в коде/доках; ветка `feature/gpu-tensor-parallel`
+> отправлена в `origin` (форк `savvadesogle/openvino`), `upstream` не тронут. Все стадийные гейты
+> подтверждены **статически** (ревью кода/сигнатур): сборка OpenVINO и 2× GPU/GenAI недоступны в
+> рабочей среде, поэтому перф-гейты S14–S16 (TPOT/TTFT) — **частичные**. Детали/блокеры/числа —
+> `STATE.md`; карта артефактов и ограничений — `docs/notes/tp-artifacts.md`. Следующие этапы
+> (in-graph коллективы, peer-бэкенд/события, zero-copy rank-import, upstream-серия PR) —
+> `NEXT-FEATURES.md`; запуск/подтверждение гейта на железе — `NEXT-TESTING.md`.
+
 ## 6. Тест-матрица (все проверки — на Qwen3.5-9B-int4-ov)
 
 - Паритет логитов/токенов TP1 vs TP2 (prefill, decode), greedy.
